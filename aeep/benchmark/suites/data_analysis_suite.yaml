@@ -1,0 +1,29 @@
+suite_id: data_analysis
+name: Data Analysis Benchmark
+description: Evaluates AI capabilities in data analysis tasks
+tags: [data, analysis]
+
+tasks:
+  - task_id: da_describe
+    name: Data Description
+    description: Describe a dataset and suggest analysis approaches
+    input: "Given a CSV dataset with columns: age, income, education, job_type — describe the data and suggest 3 analysis approaches."
+    expected_keywords: [distribution, correlation, analysis, visualization]
+    min_score: 60.0
+    tags: [description, eda]
+
+  - task_id: da_code
+    name: Analysis Code
+    description: Write pandas code for data cleaning
+    input: "Write Python pandas code to clean a dataset: handle missing values, remove duplicates, normalize numeric columns."
+    expected_keywords: [pandas, dropna, fillna, duplicates]
+    min_score: 65.0
+    tags: [pandas, cleaning]
+
+  - task_id: da_insights
+    name: Business Insights
+    description: Extract business insights from analysis results
+    input: "Given that average income increases 15% with each education level — write 3 business insights and recommendations."
+    expected_keywords: [insight, recommendation, education, income]
+    min_score: 60.0
+    tags: [insights, business]

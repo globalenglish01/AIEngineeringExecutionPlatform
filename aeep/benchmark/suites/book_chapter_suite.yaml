@@ -1,0 +1,29 @@
+suite_id: book_chapter
+name: Book Chapter Writing Benchmark
+description: Evaluates quality of AI-generated book chapter content
+tags: [writing, book]
+
+tasks:
+  - task_id: bc_intro
+    name: Introduction Chapter
+    description: Write an introduction chapter for a book about Python programming
+    input: "Write a 500-word introduction chapter for a Python programming book targeting beginners."
+    expected_keywords: [Python, programming, beginner, introduction]
+    min_score: 60.0
+    tags: [introduction]
+
+  - task_id: bc_technical
+    name: Technical Deep Dive
+    description: Write a technical chapter about asyncio concurrency in Python
+    input: "Write a technical chapter explaining Python asyncio, event loops, and coroutines."
+    expected_keywords: [asyncio, event loop, coroutine, async, await]
+    min_score: 65.0
+    tags: [technical]
+
+  - task_id: bc_conclusion
+    name: Conclusion Chapter
+    description: Write a conclusion that summarizes key learnings
+    input: "Write a conclusion chapter summarizing what readers learned about Python."
+    expected_keywords: [summary, learned, Python, next steps]
+    min_score: 60.0
+    tags: [conclusion]

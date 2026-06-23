@@ -1,0 +1,29 @@
+suite_id: code_generation
+name: Code Generation Benchmark
+description: Evaluates AI code generation quality across common tasks
+tags: [code, python]
+
+tasks:
+  - task_id: cg_function
+    name: Simple Function
+    description: Generate a Python function to calculate fibonacci numbers
+    input: "Write a Python function that calculates the nth Fibonacci number efficiently."
+    expected_keywords: [def, fibonacci, return, int]
+    min_score: 70.0
+    tags: [function, algorithm]
+
+  - task_id: cg_class
+    name: Class Implementation
+    description: Generate a Python class for a stack data structure
+    input: "Write a Python class implementing a Stack with push, pop, peek, and is_empty methods."
+    expected_keywords: [class, def push, def pop, def peek]
+    min_score: 70.0
+    tags: [class, data-structure]
+
+  - task_id: cg_async
+    name: Async Function
+    description: Generate an async function for HTTP requests
+    input: "Write an async Python function to fetch JSON data from a URL using httpx."
+    expected_keywords: [async def, await, httpx, json]
+    min_score: 65.0
+    tags: [async, http]
