@@ -27,6 +27,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "structlog" },
     { name = "tiktoken" },
+    { name = "typer" },
 ]
 
 [package.optional-dependencies]
@@ -81,6 +82,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "structlog", specifier = ">=24.2" },
     { name = "tiktoken", specifier = ">=0.7" },
+    { name = "typer", specifier = ">=0.25.1" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
 ]
 provides-extras = ["browser", "api", "dev"]
