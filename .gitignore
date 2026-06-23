@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.secrets/
+.checkpoints/
+artifacts/
+*.db
+.python-version
