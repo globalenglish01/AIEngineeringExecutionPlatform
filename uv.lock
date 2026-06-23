@@ -12,6 +12,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
+    { name = "beautifulsoup4" },
     { name = "cryptography" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -54,6 +55,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'api'", specifier = ">=0.30" },
     { name = "anyio", specifier = ">=4.4" },
+    { name = "beautifulsoup4", specifier = ">=4.15.0" },
     { name = "beautifulsoup4", marker = "extra == 'browser'", specifier = ">=4.12" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "httpx", specifier = ">=0.27" },
