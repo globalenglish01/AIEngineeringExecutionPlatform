@@ -1,0 +1,15 @@
+﻿Review the following code and provide structured feedback.
+
+## Code
+```{{ language | default("python") }}
+{{ code }}
+```
+
+Evaluate across these dimensions:
+1. **Correctness** — logic errors, edge cases, off-by-one
+2. **Security** — injection, auth, data exposure
+3. **Performance** — complexity, unnecessary allocations
+4. **Maintainability** — naming, structure, duplication
+5. **Test Coverage** — missing test cases
+
+For each issue: location → severity (critical/major/minor) → suggested fix.

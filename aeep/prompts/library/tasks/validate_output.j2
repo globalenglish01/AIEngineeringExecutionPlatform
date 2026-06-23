@@ -1,0 +1,15 @@
+﻿Validate the following output against the given criteria.
+
+## Output to Validate
+{{ output }}
+
+## Validation Criteria
+{% for criterion in criteria %}
+- {{ criterion }}
+{% endfor %}
+
+Provide:
+- **Score**: 0-100
+- **Pass/Fail**: (pass if score >= {{ min_score | default(70) }})
+- **Issues**: List specific problems found
+- **Suggestions**: Concrete improvements

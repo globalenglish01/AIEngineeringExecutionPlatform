@@ -1,0 +1,19 @@
+﻿Write a chapter for the following specification.
+
+## Chapter Details
+- **Title**: {{ title }}
+- **Target length**: {{ target_length | default("2000-3000 words") }}
+- **Audience**: {{ audience | default("technical professionals") }}
+
+{% if outline %}
+## Outline
+{{ outline }}
+{% endif %}
+
+{% if previous_chapters %}
+## Previous Chapters Summary
+{{ previous_chapters }}
+{% endif %}
+
+Write the full chapter following the outline. Use clear headings, concrete examples,
+and end with a summary of key takeaways.

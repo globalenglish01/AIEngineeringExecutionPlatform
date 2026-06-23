@@ -1,0 +1,16 @@
+﻿Generate production-ready code for the following specification.
+
+## Specification
+{{ specification }}
+
+## Requirements
+- Language: {{ language | default("Python") }}
+- Style: Clean, readable, minimal comments
+- Include: Type hints, error handling, docstring for public API
+
+{% if examples %}
+## Examples / Tests
+{{ examples }}
+{% endif %}
+
+Output only the code. No explanations before or after unless specifically requested.

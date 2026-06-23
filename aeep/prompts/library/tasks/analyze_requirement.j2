@@ -1,0 +1,18 @@
+﻿Analyze the following requirement and produce a structured breakdown.
+
+## Requirement
+{{ requirement }}
+
+{% if constraints %}
+## Constraints
+{% for c in constraints %}
+- {{ c }}
+{% endfor %}
+{% endif %}
+
+Provide:
+1. **Core Need** — the fundamental problem being solved
+2. **Functional Requirements** — what the system must do
+3. **Non-Functional Requirements** — performance, security, scalability
+4. **Acceptance Criteria** — measurable conditions for success
+5. **Open Questions** — ambiguities that need clarification
