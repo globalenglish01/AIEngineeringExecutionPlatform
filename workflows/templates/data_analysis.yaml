@@ -1,0 +1,108 @@
+name: data_analysis
+description: >
+  Understand data → design analysis plan → generate code →
+  execute analysis → validate results → generate report.
+version: "1.0"
+
+defaults:
+  provider_name: deepseek
+  model: deepseek-chat
+  temperature: 0.3
+  max_tokens: 4096
+
+nodes:
+  - id: understand_data
+    type: llm
+    config:
+      prompt_template: |
+        You are a data scientist. Understand this dataset and analysis goal:
+
+        Dataset description: $dataset_description
+        Analysis goal: $analysis_goal
+
+        Provide:
+        1. Data types and structure
+        2. Key variables to analyze
+        3. Potential issues (missing values, outliers)
+        4. Recommended analysis methods
+      output_key: data_understanding
+      max_tokens: 2000
+
+  - id: design_analysis
+    type: llm
+    depends_on: [understand_data]
+    config:
+      prompt_template: |
+        Based on this data understanding:
+        $data_understanding
+
+        Design a complete analysis plan for: $analysis_goal
+
+        Include:
+        1. Step-by-step analysis workflow
+        2. Statistical methods to apply
+        3. Visualizations to create
+        4. Expected insights
+      output_key: analysis_plan
+      max_tokens: 2000
+
+  - id: generate_analysis_code
+    type: llm
+    depends_on: [design_analysis]
+    config:
+      prompt_template: |
+        Write Python analysis code for:
+        $analysis_plan
+
+        Dataset: $dataset_description
+
+        Use pandas, numpy, matplotlib/seaborn if needed.
+        Include: data loading simulation, analysis, and print key findings.
+        Make the code self-contained and runnable.
+        Output ONLY the code.
+      output_key: analysis_code
+      temperature: 0.2
+      max_tokens: 4000
+
+  - id: execute_analysis
+    type: code_execution
+    depends_on: [generate_analysis_code]
+    config:
+      code_key: analysis_code
+      timeout: 120
+      output_key: analysis_results
+
+  - id: validate_results
+    type: validation
+    depends_on: [execute_analysis]
+    config:
+      input_key: analysis_code
+      artifact_type: code
+      min_score: 60.0
+      on_fail: warn
+      output_key: analysis_validation
+
+  - id: generate_report
+    type: llm
+    depends_on: [execute_analysis]
+    config:
+      prompt_template: |
+        Generate a professional data analysis report based on:
+
+        Analysis Goal: $analysis_goal
+        Analysis Plan: $analysis_plan
+        Results: $analysis_results
+
+        Format as Markdown with:
+        - Executive Summary
+        - Key Findings (numbered)
+        - Methodology
+        - Conclusions and Recommendations
+      output_key: analysis_report
+      max_tokens: 3000
+
+outputs:
+  analysis_report: Final analysis report (Markdown)
+  analysis_code: Python analysis code
+  analysis_results: Code execution results
+  data_understanding: Data understanding summary

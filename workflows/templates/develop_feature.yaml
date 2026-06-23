@@ -1,0 +1,124 @@
+name: develop_feature
+description: >
+  Analyze requirements → design → generate code → generate tests →
+  execute tests → fix loop → code review → final output.
+version: "1.0"
+
+defaults:
+  provider_name: deepseek
+  model: deepseek-chat
+  temperature: 0.3
+  max_tokens: 8192
+
+nodes:
+  - id: analyze_requirements
+    type: llm
+    config:
+      prompt_template: |
+        You are a senior software engineer. Analyze this feature request:
+        $feature_request
+
+        Output a structured analysis covering:
+        1. Core functionality required
+        2. Edge cases and error handling
+        3. Dependencies and integration points
+        4. Acceptance criteria (testable)
+      output_key: requirements_analysis
+      max_tokens: 2048
+
+  - id: design_solution
+    type: llm
+    depends_on: [analyze_requirements]
+    config:
+      prompt_template: |
+        Based on this analysis:
+        $requirements_analysis
+
+        Design the implementation for: $feature_name
+        Language/Framework: $tech_stack
+
+        Provide:
+        1. Class/function signatures
+        2. Data structures
+        3. Algorithm description
+        4. Integration approach
+      output_key: design_doc
+      max_tokens: 3000
+
+  - id: generate_code
+    type: llm
+    depends_on: [design_solution]
+    config:
+      prompt_template: |
+        Implement the following design in $tech_stack:
+        $design_doc
+
+        Requirements: $requirements_analysis
+        Feature: $feature_name
+
+        Write clean, well-structured, production-ready code.
+        Include docstrings and type hints.
+        Output ONLY the code, no explanations.
+      output_key: implementation_code
+      temperature: 0.2
+      max_tokens: 6000
+
+  - id: generate_tests
+    type: llm
+    depends_on: [generate_code]
+    config:
+      prompt_template: |
+        Write comprehensive unit tests for:
+        $implementation_code
+
+        Requirements being tested:
+        $requirements_analysis
+
+        Use pytest. Cover: happy path, edge cases, error conditions.
+        Output ONLY the test code.
+      output_key: test_code
+      temperature: 0.2
+      max_tokens: 4000
+
+  - id: execute_tests
+    type: code_execution
+    depends_on: [generate_tests]
+    config:
+      code_key: test_code
+      timeout: 60
+      output_key: test_results
+
+  - id: check_tests_passed
+    type: branch
+    depends_on: [execute_tests]
+    config:
+      condition_key: test_results
+      condition_op: truthy
+      true_branch: tests_ran
+      false_branch: no_tests
+      output_key: test_decision
+
+  - id: code_review
+    type: llm
+    depends_on: [execute_tests]
+    config:
+      prompt_template: |
+        Review this code for quality, correctness, and best practices:
+        $implementation_code
+
+        Test results:
+        $test_results
+
+        Provide:
+        1. Overall quality score (0-100)
+        2. Critical issues (must fix)
+        3. Suggestions (nice to have)
+        4. Final verdict: APPROVED or NEEDS_REVISION
+      output_key: code_review
+      max_tokens: 2000
+
+outputs:
+  implementation_code: Final implementation
+  test_code: Test suite
+  test_results: Test execution results
+  code_review: Code review report

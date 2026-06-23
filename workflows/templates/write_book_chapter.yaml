@@ -1,0 +1,96 @@
+name: write_book_chapter
+description: >
+  Analyze requirements → generate outline → write chapter content →
+  validate quality → loop to fix if needed → final output.
+version: "1.0"
+
+defaults:
+  provider_name: deepseek
+  model: deepseek-chat
+  temperature: 0.7
+  max_tokens: 8192
+
+nodes:
+  - id: analyze_requirements
+    type: llm
+    config:
+      prompt_template: |
+        You are an expert book author.
+        Analyze the following chapter requirements and extract:
+        1. Target audience
+        2. Key topics to cover
+        3. Recommended chapter length (word count)
+        4. Tone and style guidelines
+
+        Requirements:
+        $requirements
+      output_key: requirements_analysis
+      max_tokens: 1024
+
+  - id: generate_outline
+    type: llm
+    depends_on: [analyze_requirements]
+    config:
+      prompt_template: |
+        Based on this analysis:
+        $requirements_analysis
+
+        Create a detailed chapter outline for: $chapter_title
+
+        Format as a numbered list with sub-points.
+        Include: introduction, main sections, conclusion, key takeaways.
+      output_key: chapter_outline
+      max_tokens: 2048
+
+  - id: write_chapter
+    type: llm
+    depends_on: [generate_outline]
+    config:
+      prompt_template: |
+        Write a complete, high-quality book chapter following this outline:
+
+        Title: $chapter_title
+        Outline:
+        $chapter_outline
+
+        Requirements: $requirements
+
+        Write in a clear, engaging style. Include examples, explanations, and insights.
+        Target length: at least 1500 words.
+      output_key: chapter_content
+      max_tokens: 8192
+
+  - id: validate_chapter
+    type: validation
+    depends_on: [write_chapter]
+    config:
+      input_key: chapter_content
+      artifact_type: markdown
+      min_score: 70.0
+      gate_type: progressive
+      on_fail: warn
+      output_key: chapter_validation
+
+  - id: check_quality
+    type: branch
+    depends_on: [validate_chapter]
+    config:
+      condition_key: validate_chapter_passed
+      condition_op: truthy
+      true_branch: approved
+      false_branch: needs_revision
+      output_key: quality_decision
+
+  - id: revise_if_needed
+    type: loop
+    depends_on: [check_quality]
+    config:
+      max_iterations: 3
+      exit_key: chapter_validation_passed
+      output_key: revision_result
+
+outputs:
+  chapter_content: Final chapter text (Markdown)
+  chapter_outline: Chapter outline
+  requirements_analysis: Requirement analysis
+  chapter_validation: Validation result
