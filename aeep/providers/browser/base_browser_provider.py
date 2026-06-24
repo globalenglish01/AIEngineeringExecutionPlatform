@@ -206,9 +206,9 @@ class BaseBrowserProvider(BaseLLMProvider):
         for m in non_system:
             if m.role == Role.USER:
                 if not first_user_done and system_parts:
-                    # Merge system context into the first user message
+                    # Task FIRST, then instructions — helps browser LLMs focus on the task
                     system_block = "\n\n".join(system_parts)
-                    parts.append(f"{system_block}\n\n{m.content}")
+                    parts.append(f"{m.content}\n\n---\n{system_block}")
                     first_user_done = True
                 else:
                     parts.append(m.content)

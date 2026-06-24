@@ -64,7 +64,12 @@ class FileTool(BaseTool):
 
     async def execute(self, args: dict[str, Any]) -> ToolResult:
         action = args.get("action", "")
-        path_str = args.get("path", "")
+        # Accept common LLM aliases for parameter names
+        path_str = args.get("path") or args.get("file_path") or args.get("filename") or ""
+        if "limit_rows" in args and "limit" not in args:
+            args = dict(args, limit=args["limit_rows"])
+        if "offset_rows" in args and "offset" not in args:
+            args = dict(args, offset=args["offset_rows"])
 
         try:
             resolved = self._resolve(path_str)

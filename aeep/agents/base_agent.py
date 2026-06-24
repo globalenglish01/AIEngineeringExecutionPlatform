@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, TYPE_CHECKING
 
 from aeep.agents.models import AgentResult, AgentStatus, AgentStep
@@ -84,6 +85,8 @@ class BaseAgent:
         and Chinese (思考/行动/输入/最终答案) keyword variants.
         """
         step = AgentStep()
+        # Normalise "思考\n：xxx" → "思考：xxx" (colon split across lines)
+        content = re.sub(r'(思考|行动|输入|最终答案)\s*\n\s*[：:]', r'\1：', content)
         lines = content.strip().splitlines()
         # Collect multi-line Action Input / 输入 blocks
         input_lines: list[str] = []
@@ -117,7 +120,12 @@ class BaseAgent:
             try:
                 step.action_input = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
-                step.action_input = {"input": raw}
+                # Fix unescaped Windows backslashes (e.g. C:\Users → C:\\Users)
+                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+                try:
+                    step.action_input = json.loads(fixed)
+                except (json.JSONDecodeError, ValueError):
+                    step.action_input = {"input": raw}
 
         if not step.action and not step.is_final:
             # No structure found — treat entire response as final answer
@@ -131,15 +139,15 @@ class BaseAgent:
             f"- {t.name}: {t.description}" for t in [self._registry.get(n) for n in self._registry.list_names()]
         )
         return (
-            f"你是 {self.name}，{self.role}\n\n"
-            "请严格按照以下格式逐步完成任务，每次只输出一个步骤：\n\n"
-            "思考：<分析当前情况，决定下一步>\n"
-            "行动：<工具名称>\n"
-            "输入：<JSON格式的工具参数>\n\n"
-            "收到工具结果后继续输出下一个步骤，直到任务完成，然后输出：\n\n"
-            "最终答案：<完整的最终回复>\n\n"
-            f"可用工具：\n{tool_descriptions or '（无工具）'}\n\n"
-            "重要：每次只输出一个步骤（思考+行动+输入），等待工具结果后再继续。"
+            f"你是{self.role}\n\n"
+            "【输出格式】每次只输出以下一个步骤，等待工具结果后再继续：\n"
+            "思考：<分析>\n"
+            "行动：<工具名>\n"
+            "输入：<合法JSON，Windows路径用双反斜杠 C:\\\\Users\\\\xxx>\n\n"
+            "所有步骤完成后输出：\n"
+            "最终答案：<结果>\n\n"
+            f"【可用工具】\n{tool_descriptions or '（无工具）'}\n"
+            "file_tool read_csv参数：path、columns（数组）、limit（整数）、offset（整数）"
         )
 
     @property
