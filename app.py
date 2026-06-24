@@ -88,6 +88,27 @@ def do_add_account(target: str, label: str) -> tuple[str, Any]:
         return f"❌ 添加失败: {exc}", _render_account_table(target)
 
 
+def do_rename_from_table(target: str, data: Any) -> Any:
+    """Handle inline edits to the Account column in the Dataframe."""
+    import pandas as pd
+    pool = _get_pool(target)
+    slots = pool.slots()
+    if data is None or not slots:
+        return _render_account_table(target)
+    rows = data.values.tolist() if isinstance(data, pd.DataFrame) else data
+    changed = False
+    for i, row in enumerate(rows):
+        if i >= len(slots):
+            break
+        new_label = str(row[1]).strip()   # column index 1 = Account
+        if new_label and new_label != slots[i].label:
+            slots[i].label = new_label
+            changed = True
+    if changed:
+        pool._save()
+    return _render_account_table(target)
+
+
 def do_reconnect(target: str, slot_label: str) -> tuple[str, Any]:
     """Reopen the browser for an existing account (e.g. after page refresh)."""
     try:
@@ -336,8 +357,8 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             )
             acct_table = gr.Dataframe(
                 headers=["No.", "Account", "Status", "Cookie"],
-                label="Account Pool",
-                interactive=False,
+                label="Account Pool (Account column is editable)",
+                interactive=True,
                 row_count=(1, "dynamic"),
             )
 
@@ -390,6 +411,12 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 _refresh,
                 inputs=[target_dd],
                 outputs=[acct_table, acct_select],
+            )
+            # Inline rename: user edits Account column → save immediately
+            acct_table.change(
+                do_rename_from_table,
+                inputs=[target_dd, acct_table],
+                outputs=[acct_table],
             )
 
         # ── Tab 1: 对话 ──────────────────────────────────────────────
