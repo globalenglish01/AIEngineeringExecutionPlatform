@@ -113,8 +113,14 @@ def _render_account_table(target: str) -> Any:
     pool = _get_pool(target)
     rows = pool.status_table()
     if not rows:
-        return gr.update(value=None)
-    return gr.update(value=rows)
+        return gr.update(value=[])
+    # Convert list-of-dicts to list-of-lists (Gradio Dataframe format)
+    keys = ["No.", "Account", "Status", "Cookie"]
+    data = [
+        [r["序号"], r["账号"], r["状态"], r["Cookie"]]
+        for r in rows
+    ]
+    return gr.update(value=data, headers=keys)
 
 
 def _slot_labels(target: str) -> list[str]:
@@ -317,8 +323,8 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 value="",
             )
             acct_table = gr.Dataframe(
-                headers=["序号", "账号", "状态", "Cookie"],
-                label="当前账号池",
+                headers=["No.", "Account", "Status", "Cookie"],
+                label="Account Pool",
                 interactive=False,
                 row_count=(1, "dynamic"),
             )
