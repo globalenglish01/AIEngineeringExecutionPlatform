@@ -19,7 +19,7 @@ if errorlevel 1 (
 echo [1/3] Done.
 
 echo [2/3] Installing Playwright browser (skipped if already installed)...
-uv run playwright install chromium
+uv run python -m playwright install chromium
 echo [2/3] Done.
 
 echo [3/3] Launching Web UI...
