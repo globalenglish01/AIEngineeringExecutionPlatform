@@ -49,7 +49,7 @@ class BrowserConfig:
     def __init__(
         self,
         browser_type: str = "chromium",
-        headless: bool = True,
+        headless: bool = False,          # False = visible window; user can do Google login manually
         cookie_path: str | None = None,
         login_timeout: int = 300,
         max_sessions: int = 3,

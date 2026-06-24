@@ -44,11 +44,21 @@ def run_async(coro: Any, timeout: int = 300) -> Any:
 _providers: dict[str, Any] = {}
 
 
+_COOKIE_DIR = Path(".browser_cookies")
+
+
 async def _get_provider(target: str) -> Any:
     from aeep.providers.browser.browser_provider import BrowserProvider
+    from aeep.providers.browser.session import BrowserConfig
 
     if target not in _providers:
-        _providers[target] = BrowserProvider(target=target)
+        _COOKIE_DIR.mkdir(exist_ok=True)
+        cookie_file = str(_COOKIE_DIR / f"{target}.json")
+        config = BrowserConfig(
+            headless=False,          # visible window so user can do Google login
+            cookie_path=cookie_file, # persist login across restarts
+        )
+        _providers[target] = BrowserProvider(target=target, config=config)
     return _providers[target]
 
 
@@ -60,13 +70,31 @@ def do_connect(target: str) -> tuple[str, dict]:
     try:
         provider = run_async(_get_provider(target))
         run_async(provider._ensure_initialized(), timeout=60)
-        msg = (
-            f"浏览器已启动！请在弹出的浏览器窗口中登录 {target}，"
-            "登录完成后回到此页面即可使用。"
-        )
+
+        # Check if cookies exist (already logged in)
+        cookie_file = _COOKIE_DIR / f"{target}.json"
+        if cookie_file.exists():
+            msg = f"已用保存的登录状态连接 {target}（Cookie 已加载，无需重新登录）"
+        else:
+            target_names = {"chatgpt": "ChatGPT", "claude_ai": "Claude.ai", "deepseek": "DeepSeek"}
+            name = target_names.get(target, target)
+            msg = (
+                f"浏览器窗口已打开！\n"
+                f"请在浏览器中登录 {name}（支持 Google 账号登录）。\n"
+                f"登录成功后，点击下方「保存登录状态」按钮，下次启动无需重新登录。"
+            )
         return msg, gr.update(variant="secondary", value="已连接 ✓")
     except Exception as exc:
         return f"启动失败: {exc}", gr.update(variant="primary", value="启动浏览器")
+
+
+def do_save_cookies(target: str) -> str:
+    try:
+        provider = run_async(_get_provider(target))
+        run_async(provider._session.save_cookies())
+        return "✅ 登录状态已保存！下次启动自动复用，无需重新登录。"
+    except Exception as exc:
+        return f"❌ 保存失败: {exc}"
 
 
 def do_chat(
@@ -221,19 +249,17 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             scale=2,
         )
         connect_btn = gr.Button("🚀 启动浏览器", variant="primary", scale=1)
+        save_btn = gr.Button("💾 保存登录状态", variant="secondary", scale=1)
         status_txt = gr.Textbox(
-            value="尚未连接 — 点击「启动浏览器」",
+            value="尚未连接 — 点击「启动浏览器」，在弹出窗口中用 Google 账号登录",
             label="状态",
             interactive=False,
-            scale=3,
+            scale=4,
             elem_classes=["status-bar"],
         )
 
-    connect_btn.click(
-        do_connect,
-        inputs=[target_dd],
-        outputs=[status_txt, connect_btn],
-    )
+    connect_btn.click(do_connect, inputs=[target_dd], outputs=[status_txt, connect_btn])
+    save_btn.click(do_save_cookies, inputs=[target_dd], outputs=[status_txt])
 
     # ---------- 功能标签页 ----------
     with gr.Tabs():
@@ -319,12 +345,17 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
         # ── Tab 4: 帮助 ───────────────────────────────────────────────
         with gr.Tab("📖 使用说明"):
             gr.Markdown("""
-## 快速开始
+## 快速开始（首次）
 
 1. **选择 AI 目标**（顶部下拉菜单）
-2. **点击「启动浏览器」** — 会弹出一个 Chromium 窗口
-3. **在弹出窗口中登录**对应网站（ChatGPT / Claude.ai / DeepSeek）
-4. 登录成功后回到此页面，**开始对话或使用 Agent**
+2. **点击「🚀 启动浏览器」** — 会弹出一个可见的 Chromium 窗口
+3. **在弹出窗口中登录**：支持用 **Google 账号** 登录 ChatGPT / Claude.ai / DeepSeek
+4. 登录成功后，点击 **「💾 保存登录状态」** — Cookie 保存到本地，**下次无需重登录**
+5. 回到此页面，开始对话或使用 Agent
+
+## 再次启动（已登录）
+
+直接点「🚀 启动浏览器」，系统自动加载上次保存的登录状态，无需再次登录。
 
 ---
 
