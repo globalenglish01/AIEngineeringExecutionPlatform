@@ -93,6 +93,17 @@ def do_add_account(target: str, label: str) -> tuple[str, Any]:
         return f"❌ 添加失败: {exc}", _render_account_table(target)
 
 
+def do_import(target: str, source_path: str) -> tuple[str, Any, Any]:
+    try:
+        pool = _get_pool(target)
+        imported, skipped = pool.import_from_file(source_path.strip())
+        msg = f"Imported {imported} account(s), skipped {skipped} duplicate(s)."
+        choices = _slot_labels(target)
+        return msg, _render_account_table(target), gr.update(choices=choices, value=choices[-1] if choices else None)
+    except Exception as exc:
+        return f"Import failed: {exc}", _render_account_table(target), gr.update()
+
+
 def do_rename_from_table(target: str, data: Any) -> str:
     """Handle inline edits to the Account column. Returns status string (not table)
     to avoid triggering another change event and causing an infinite loop."""
@@ -369,6 +380,15 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 row_count=(1, "dynamic"),
             )
 
+            # Import from other project
+            with gr.Row():
+                import_path_box = gr.Textbox(
+                    label="Import from accounts.json (paste full path)",
+                    placeholder=r"D:\My\AIEducationOS\engine\llm\accounts.json",
+                    scale=4,
+                )
+                import_btn = gr.Button("📥 Import", variant="secondary", scale=1)
+
             with gr.Row():
                 acct_select = gr.Dropdown(label="Select account", choices=[], scale=3)
                 reconnect_btn = gr.Button("🔌 Reconnect", variant="primary", scale=1)
@@ -393,6 +413,11 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 choices = _slot_labels(target)
                 return _render_account_table(target), gr.update(choices=choices)
 
+            import_btn.click(
+                do_import,
+                inputs=[target_dd, import_path_box],
+                outputs=[acct_status_txt, acct_table, acct_select],
+            )
             add_acct_btn.click(
                 _add,
                 inputs=[target_dd, acct_label_box],

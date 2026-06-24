@@ -259,3 +259,54 @@ class AccountPool:
 
     def status_table(self) -> list[dict]:
         return [s.to_dict() for s in self._slots]
+
+    def import_from_file(self, source_path: str) -> tuple[int, int]:
+        """Import accounts from another project's accounts.json.
+
+        Source format (AIEducationOS / TestAgentPythonProject):
+            {"accounts": [{"id": "acc_xxx", "name": "...", "storage_dir": "...", "logged_in": true}]}
+
+        Returns (imported_count, skipped_count).
+        """
+        src = Path(source_path)
+        if not src.exists():
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        data = json.loads(src.read_text(encoding="utf-8"))
+        # Support both {"accounts": [...]} and {"chatgpt": [...]} formats
+        entries = data.get("accounts") or data.get(self.target) or []
+
+        existing_ids = {s.id for s in self._slots}
+        imported = 0
+        skipped = 0
+
+        for entry in entries:
+            acc_id = entry.get("id", f"acc_{uuid.uuid4().hex[:8]}")
+            if acc_id in existing_ids:
+                skipped += 1
+                continue
+
+            user_data_dir = entry.get("storage_dir") or entry.get("user_data_dir", "")
+            if not user_data_dir:
+                skipped += 1
+                continue
+
+            idx = len(self._slots)
+            slot = AccountSlot(
+                id=acc_id,
+                index=idx,
+                label=entry.get("name") or entry.get("label") or f"account{idx + 1}",
+                target=self.target,
+                user_data_dir=user_data_dir,
+                status="ready",
+                logged_in=entry.get("logged_in", True),
+            )
+            self._slots.append(slot)
+            existing_ids.add(acc_id)
+            imported += 1
+
+        if imported > 0:
+            self._save()
+            logger.info("AccountPool[%s]: imported %d accounts from %s", self.target, imported, src)
+
+        return imported, skipped
