@@ -109,18 +109,16 @@ def do_refresh_status(target: str) -> Any:
     return _render_account_table(target)
 
 
-def _render_account_table(target: str) -> Any:
+def _render_account_table(target: str):
+    import pandas as pd
     pool = _get_pool(target)
     rows = pool.status_table()
     if not rows:
-        return gr.update(value=[])
-    # Convert list-of-dicts to list-of-lists (Gradio Dataframe format)
-    keys = ["No.", "Account", "Status", "Cookie"]
-    data = [
-        [r["序号"], r["账号"], r["状态"], r["Cookie"]]
-        for r in rows
-    ]
-    return gr.update(value=data, headers=keys)
+        return pd.DataFrame(columns=["No.", "Account", "Status", "Cookie"])
+    return pd.DataFrame(
+        [[r["no"], r["account"], r["status"], r["cookie"]] for r in rows],
+        columns=["No.", "Account", "Status", "Cookie"],
+    )
 
 
 def _slot_labels(target: str) -> list[str]:
@@ -336,18 +334,18 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 refresh_btn = gr.Button("🔄 刷新状态", scale=1)
 
             def _add(target, label):
-                msg, table = do_add_account(target, label)
+                msg, _ = do_add_account(target, label)
                 choices = _slot_labels(target)
-                return msg, table, gr.update(choices=choices, value=choices[-1] if choices else None)
+                return msg, _render_account_table(target), gr.update(choices=choices, value=choices[-1] if choices else None)
 
             def _save(target, lbl):
-                msg, table = do_save_cookies(target, lbl)
-                return msg, table
+                msg, _ = do_save_cookies(target, lbl)
+                return msg, _render_account_table(target)
 
             def _del(target, lbl):
-                msg, table = do_remove_account(target, lbl)
+                msg, _ = do_remove_account(target, lbl)
                 choices = _slot_labels(target)
-                return msg, table, gr.update(choices=choices, value=choices[0] if choices else None)
+                return msg, _render_account_table(target), gr.update(choices=choices, value=choices[0] if choices else None)
 
             def _refresh(target):
                 choices = _slot_labels(target)

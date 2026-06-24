@@ -62,12 +62,17 @@ class AccountSlot:
 
     def to_dict(self) -> dict:
         cd = self.cooldown_remaining
-        status_display = f"冷却中 ({cd}s)" if self.status == "冷却中" and cd > 0 else self.status
+        if self.status == "冷却中" and cd > 0:
+            status_display = f"cooling ({cd}s)"
+        elif self.status == "就绪":
+            status_display = "ready"
+        else:
+            status_display = self.status
         return {
-            "序号": self.index + 1,
-            "账号": self.label,
-            "状态": status_display,
-            "Cookie": "✓ 已保存" if Path(self.cookie_path).exists() else "✗ 未保存",
+            "no": self.index + 1,
+            "account": self.label,
+            "status": status_display,
+            "cookie": "saved" if Path(self.cookie_path).exists() else "not saved",
         }
 
 
