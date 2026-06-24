@@ -27,7 +27,12 @@ def _bg_loop() -> asyncio.AbstractEventLoop:
     global _loop
     with _loop_lock:
         if _loop is None or _loop.is_closed():
-            _loop = asyncio.new_event_loop()
+            # ProactorEventLoop required on Windows for Playwright subprocess windows
+            if sys.platform == "win32":
+                loop: asyncio.AbstractEventLoop = asyncio.ProactorEventLoop()
+            else:
+                loop = asyncio.new_event_loop()
+            _loop = loop
             t = threading.Thread(target=_loop.run_forever, daemon=True)
             t.start()
     return _loop

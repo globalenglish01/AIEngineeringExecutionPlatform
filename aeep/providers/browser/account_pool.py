@@ -102,6 +102,15 @@ class AccountPool:
                                    name=f"{self.target}_{idx}")
         await provider._ensure_initialized()
 
+        # Navigate to the login page so the browser window is visible to the user
+        page = await provider._session.get_page("login")
+        await page.goto(
+            provider._target.base_url,
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+        await page.bring_to_front()
+
         slot = AccountSlot(index=idx, label=lbl, cookie_path=cookie_path,
                            status="就绪", provider=provider)
         self._slots.append(slot)
