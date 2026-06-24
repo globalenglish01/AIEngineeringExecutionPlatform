@@ -272,49 +272,37 @@ def _extract_file_paths(text: str) -> list[str]:
     return re.findall(r'["“”]((?:[A-Za-z]:\\|/)[^""“”\n]+)["“”]', text)
 
 
-def _read_csv_batch(
-    path: str,
-    offset: int = 0,
-    batch_size: int = 30,
-    cols: list[str] | None = None,
-    skip_cols: list[str] | None = None,
-) -> tuple[list[dict], int]:
-    """Return (rows_slice, total_rows) for a CSV batch."""
-    import csv as _csv, io as _io
-    p = Path(path)
-    text = p.read_text(encoding="utf-8-sig")
-    all_rows = list(_csv.DictReader(_io.StringIO(text)))
-    total = len(all_rows)
-    batch = all_rows[offset: offset + batch_size]
-    if cols:
-        batch = [{c: r.get(c, "") for c in cols if c in r} for r in batch]
-    elif skip_cols:
-        skip = set(skip_cols)
-        batch = [{k: v for k, v in r.items() if k not in skip} for r in batch]
-    return batch, total
-
-
 def _read_file_for_prompt(path: str, offset: int = 0, batch_size: int = 30) -> tuple[str, int, int]:
-    """Read a file slice for a prompt.  Returns (content, offset_end, total)."""
+    """Read a file slice suitable for injection into a prompt.
+
+    Returns (content_str, offset_after_batch, total_rows_or_chars).
+    For CSV: returns all columns as-is (the AI decides what to do with them).
+    For other files: returns a plain text slice.
+    """
     import csv as _csv, io as _io
     p = Path(path)
     if not p.exists():
         return f"[文件不存在: {path}]", 0, 0
     if p.suffix.lower() == ".csv":
-        # Only send word/kana/meaning — skip verbose prebuilt columns
-        keep = ["word", "kana", "pos", "meaning"]
-        rows, total = _read_csv_batch(path, offset=offset, batch_size=batch_size, cols=keep)
-        if not rows:
+        text = p.read_text(encoding="utf-8-sig")
+        all_rows = list(_csv.DictReader(_io.StringIO(text)))
+        total = len(all_rows)
+        batch = all_rows[offset: offset + batch_size]
+        if not batch:
             return "", offset, total
         out = _io.StringIO()
-        writer = _csv.DictWriter(out, fieldnames=list(rows[0].keys()))
+        writer = _csv.DictWriter(out, fieldnames=list(batch[0].keys()))
         writer.writeheader()
-        writer.writerows(rows)
-        end = offset + len(rows)
+        writer.writerows(batch)
+        end = offset + len(batch)
         header = f"# 行 {offset+1}–{end}（共 {total} 行）\n"
         return header + out.getvalue(), end, total
+    # Plain text: slice by characters
     raw = p.read_text(encoding="utf-8-sig", errors="replace")
-    return raw, len(raw), len(raw)
+    total = len(raw)
+    chunk = raw[offset: offset + batch_size * 200]  # ~200 chars per "row" for plain text
+    end = offset + len(chunk)
+    return chunk, end, total
 
 
 def do_agent(
@@ -343,11 +331,17 @@ def do_agent(
             steps_md = ""
             all_results: list[str] = []
 
-            if csv_paths and Path(csv_paths[0]).suffix.lower() == ".csv":
+            if csv_paths:
                 fp = csv_paths[0]
                 offset = 0
                 batch_num = 0
                 total = None
+                # Strip any file path mentions from task so AI sees clean instructions
+                task_core = task
+                for quoted_fp in csv_paths:
+                    task_core = task_core.replace(f'"{quoted_fp}"', "[数据见下方]")
+                    task_core = task_core.replace(f'"{quoted_fp}"', "[数据见下方]")
+                    task_core = task_core.replace(quoted_fp, "[数据见下方]")
                 while True:
                     content, end, tot = _read_file_for_prompt(fp, offset=offset, batch_size=batch_size)
                     if total is None:
@@ -356,13 +350,10 @@ def do_agent(
                         break
                     batch_num += 1
                     steps_md += f"**📦 批次 {batch_num}** 行 {offset+1}–{end} / {total}\n\n"
-                    # Build per-batch prompt (no file path in task, we inject content directly)
-                    task_core = task.split("---")[0].strip()  # strip any prior injected content
                     prompt = (
                         f"{task_core}\n\n"
                         f"--- 数据（行 {offset+1}–{end}，共 {total} 行）---\n"
-                        f"{content}\n--- 数据结束 ---\n\n"
-                        f"请只输出这批单词的记忆方法，格式清晰，不要遗漏任何一个单词。"
+                        f"{content}\n--- 数据结束 ---"
                     )
 
                     async def _run(p=prompt):
