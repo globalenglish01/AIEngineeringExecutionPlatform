@@ -272,38 +272,49 @@ def _extract_file_paths(text: str) -> list[str]:
     return re.findall(r'["“”]((?:[A-Za-z]:\\|/)[^""“”\n]+)["“”]', text)
 
 
-def _read_file_for_prompt(path: str, max_chars: int = 8000) -> str:
-    """Read a file and return its content, trimmed to max_chars."""
+def _read_csv_batch(
+    path: str,
+    offset: int = 0,
+    batch_size: int = 30,
+    cols: list[str] | None = None,
+    skip_cols: list[str] | None = None,
+) -> tuple[list[dict], int]:
+    """Return (rows_slice, total_rows) for a CSV batch."""
+    import csv as _csv, io as _io
+    p = Path(path)
+    text = p.read_text(encoding="utf-8-sig")
+    all_rows = list(_csv.DictReader(_io.StringIO(text)))
+    total = len(all_rows)
+    batch = all_rows[offset: offset + batch_size]
+    if cols:
+        batch = [{c: r.get(c, "") for c in cols if c in r} for r in batch]
+    elif skip_cols:
+        skip = set(skip_cols)
+        batch = [{k: v for k, v in r.items() if k not in skip} for r in batch]
+    return batch, total
+
+
+def _read_file_for_prompt(path: str, offset: int = 0, batch_size: int = 30) -> tuple[str, int, int]:
+    """Read a file slice for a prompt.  Returns (content, offset_end, total)."""
     import csv as _csv, io as _io
     p = Path(path)
     if not p.exists():
-        return f"[文件不存在: {path}]"
+        return f"[文件不存在: {path}]", 0, 0
     if p.suffix.lower() == ".csv":
-        text = p.read_text(encoding="utf-8-sig")
-        reader = _csv.DictReader(_io.StringIO(text))
-        rows = list(reader)
-        total = len(rows)
-        # Build compact representation: word | kana | meaning (skip huge columns)
-        skip = {"ex_ja_ruby", "idiom_ruby"}
-        out_lines = []
-        header_written = False
-        chars = 0
-        for row in rows:
-            filtered = {k: v for k, v in row.items() if k not in skip}
-            if not header_written:
-                out_lines.append(",".join(filtered.keys()))
-                header_written = True
-            line = ",".join(f'"{v}"' if "," in v else v for v in filtered.values())
-            if chars + len(line) > max_chars:
-                out_lines.append(f"... (共 {total} 行，显示前 {len(out_lines)-1} 行)")
-                break
-            out_lines.append(line)
-            chars += len(line)
-        return "\n".join(out_lines)
+        # Only send word/kana/meaning — skip verbose prebuilt columns
+        keep = ["word", "kana", "pos", "meaning"]
+        rows, total = _read_csv_batch(path, offset=offset, batch_size=batch_size, cols=keep)
+        if not rows:
+            return "", offset, total
+        out = _io.StringIO()
+        writer = _csv.DictWriter(out, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+        end = offset + len(rows)
+        header = f"# 行 {offset+1}–{end}（共 {total} 行）\n"
+        return header + out.getvalue(), end, total
     raw = p.read_text(encoding="utf-8-sig", errors="replace")
-    if len(raw) > max_chars:
-        return raw[:max_chars] + f"\n... (已截断，原文 {len(raw)} 字符)"
-    return raw
+    return raw, len(raw), len(raw)
 
 
 def do_agent(
@@ -314,6 +325,8 @@ def do_agent(
     use_shell: bool,
     api_key: str = "",
     model: str = "",
+    save_path: str = "",
+    batch_size: int = 30,
 ) -> tuple[str, str]:
     if not task.strip():
         return "请先输入任务描述", ""
@@ -321,27 +334,77 @@ def do_agent(
         from aeep.core.models.message import Message, Role
 
         if _is_browser(target):
-            # ── 浏览器模式：直接读文件 + 单次发送 ──────────────────────
+            # ── 浏览器模式：分批读文件 + 逐批发送，结果追加保存 ─────────
             pool = _get_pool(target)
             if pool.slot_count() == 0:
                 return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
 
-            prompt = task
+            csv_paths = _extract_file_paths(task) if use_file else []
             steps_md = ""
-            if use_file:
-                for fp in _extract_file_paths(task):
-                    content = _read_file_for_prompt(fp)
-                    steps_md += f"**📂 已读取文件** `{fp}` ({len(content)} 字符)\n\n"
-                    prompt += f"\n\n--- 文件内容: {fp} ---\n{content}\n--- 文件结束 ---"
+            all_results: list[str] = []
 
-            async def _run_browser():
-                return await pool.complete(
-                    messages=[Message(role=Role.USER, content=prompt)],
-                    model="", temperature=0.7, max_tokens=4096,
-                )
+            if csv_paths and Path(csv_paths[0]).suffix.lower() == ".csv":
+                fp = csv_paths[0]
+                offset = 0
+                batch_num = 0
+                total = None
+                while True:
+                    content, end, tot = _read_file_for_prompt(fp, offset=offset, batch_size=batch_size)
+                    if total is None:
+                        total = tot
+                    if not content or end <= offset:
+                        break
+                    batch_num += 1
+                    steps_md += f"**📦 批次 {batch_num}** 行 {offset+1}–{end} / {total}\n\n"
+                    # Build per-batch prompt (no file path in task, we inject content directly)
+                    task_core = task.split("---")[0].strip()  # strip any prior injected content
+                    prompt = (
+                        f"{task_core}\n\n"
+                        f"--- 数据（行 {offset+1}–{end}，共 {total} 行）---\n"
+                        f"{content}\n--- 数据结束 ---\n\n"
+                        f"请只输出这批单词的记忆方法，格式清晰，不要遗漏任何一个单词。"
+                    )
 
-            result = run_async(_run_browser(), timeout=600)
-            return result.content or "(无输出)", steps_md
+                    async def _run(p=prompt):
+                        return await pool.complete(
+                            messages=[Message(role=Role.USER, content=p)],
+                            model="", temperature=0.7, max_tokens=4096,
+                        )
+
+                    res = run_async(_run(), timeout=600)
+                    batch_result = res.content or ""
+                    all_results.append(f"## 批次 {batch_num}（行 {offset+1}–{end}）\n\n{batch_result}")
+                    offset = end
+                    if offset >= total:
+                        break
+
+                final_output = "\n\n---\n\n".join(all_results)
+            else:
+                # Non-CSV or no file: single shot
+                prompt = task
+                if use_file:
+                    for fp in csv_paths:
+                        content, _, _ = _read_file_for_prompt(fp)
+                        steps_md += f"**📂 文件** `{fp}`\n\n"
+                        prompt += f"\n\n--- 文件内容: {fp} ---\n{content}\n--- 文件结束 ---"
+
+                async def _run_single():
+                    return await pool.complete(
+                        messages=[Message(role=Role.USER, content=prompt)],
+                        model="", temperature=0.7, max_tokens=4096,
+                    )
+
+                res = run_async(_run_single(), timeout=600)
+                final_output = res.content or "(无输出)"
+
+            # Save to file if path given
+            out_path = save_path.strip()
+            if out_path and final_output:
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(out_path).write_text(final_output, encoding="utf-8")
+                steps_md += f"\n\n**💾 已保存到** `{out_path}`"
+
+            return final_output, steps_md
 
         else:
             # ── API 模式：ReAct loop + 工具 ───────────────────────────
@@ -375,7 +438,14 @@ def do_agent(
                     steps_md += f"**⚡ 行动** `{step.action}`\n```\n{step.action_input}\n```\n\n"
                 if step.observation:
                     steps_md += f"**👁 观察**\n{step.observation}\n\n---\n\n"
-            return result.output or "(无输出)", steps_md
+
+            final_output = result.output or "(无输出)"
+            out_path = save_path.strip()
+            if out_path and final_output:
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(out_path).write_text(final_output, encoding="utf-8")
+                steps_md += f"\n\n**💾 已保存到** `{out_path}`"
+            return final_output, steps_md
 
     except Exception as exc:
         return f"❌ 错误: {exc}", ""
@@ -637,27 +707,38 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
         # ── Tab 2: Agent 模式 ─────────────────────────────────────────
         with gr.Tab("🤖 Agent 模式"):
             gr.Markdown(
-                "**浏览器模式**：直接读取文件后一次性发给 AI（稳定）\n\n"
-                "**API 模式**：AI 自主调用工具循环推理直到完成任务（功能更强）"
+                "**浏览器模式**：自动分批读取文件，逐批发给 AI，结果合并保存\n\n"
+                "**API 模式**：AI 自主调用工具循环推理直到完成任务"
             )
             task_box = gr.Textbox(
                 label="任务描述",
-                placeholder="例：为\"C:\\path\\to\\file.csv\"中的单词生成记忆方法",
+                placeholder='例：为 "C:\\Users\\xxx\\Downloads\\n1_verbs_cards.csv" 中的所有单词生成记忆方法',
                 lines=4,
             )
             with gr.Row():
                 chk_file = gr.Checkbox(label="📁 文件读写", value=True)
                 chk_search = gr.Checkbox(label="🔍 代码搜索", value=True)
                 chk_shell = gr.Checkbox(label="🖥 Shell 命令", value=False)
+            with gr.Row():
+                save_path_box = gr.Textbox(
+                    label="💾 保存结果到（路径，留空则不保存）",
+                    placeholder=r"C:\Users\xxx\Downloads\memory_output.md",
+                    scale=4,
+                )
+                batch_size_sl = gr.Slider(
+                    minimum=10, maximum=100, value=30, step=10,
+                    label="每批行数（浏览器模式）",
+                    scale=2,
+                )
             run_agent_btn = gr.Button("▶ 运行 Agent", variant="primary")
             with gr.Row():
-                agent_out = gr.Textbox(label="最终答案", lines=12, scale=3)
-                agent_steps = gr.Markdown(label="推理过程 / 文件预处理", scale=2)
+                agent_out = gr.Textbox(label="最终答案（最后一批预览）", lines=12, scale=3)
+                agent_steps = gr.Markdown(label="处理进度", scale=2)
 
             run_agent_btn.click(
                 do_agent,
                 inputs=[task_box, target_dd, chk_file, chk_search, chk_shell,
-                        api_key_box, api_model_box],
+                        api_key_box, api_model_box, save_path_box, batch_size_sl],
                 outputs=[agent_out, agent_steps],
             )
 
