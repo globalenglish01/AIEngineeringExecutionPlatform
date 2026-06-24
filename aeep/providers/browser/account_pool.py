@@ -71,7 +71,7 @@ class AccountSlot:
             "no": self.index + 1,
             "account": self.label,
             "status": status_display,
-            "cookie": "saved" if profile_exists else "pending login",
+            "cookie": "logged in" if self.logged_in else ("profile exists" if profile_exists else "pending login"),
         }
 
     def to_json(self) -> dict:

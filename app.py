@@ -128,7 +128,7 @@ def do_rename_from_table(target: str, data: Any) -> str:
 
 
 def do_reconnect(target: str, slot_label: str) -> tuple[str, Any]:
-    """Reopen the browser for an existing account (e.g. after page refresh)."""
+    """Reopen the browser for an existing account and navigate to the target site."""
     try:
         pool = _get_pool(target)
         for slot in pool.slots():
@@ -136,14 +136,42 @@ def do_reconnect(target: str, slot_label: str) -> tuple[str, Any]:
                 slot.provider = None   # force re-init
                 run_async(pool._ensure_provider(slot), timeout=60)
                 page = run_async(slot.provider._session.get_page("login"))
-                try:
-                    run_async(page.bring_to_front())
-                except Exception:
-                    pass
-                return f"Browser reopened for '{slot_label}'. If not logged in, sign in now.", _render_account_table(target)
+                base_url = slot.provider._target.base_url
+                run_async(
+                    page.goto(base_url, wait_until="domcontentloaded", timeout=30_000)
+                )
+                run_async(page.bring_to_front())
+                return f"Opened '{slot_label}' → {base_url}", _render_account_table(target)
         return "Account not found.", _render_account_table(target)
     except Exception as exc:
         return f"Reconnect failed: {exc}", _render_account_table(target)
+
+
+def do_test_all(target: str) -> tuple[str, Any]:
+    """Open every account, check login status, update table."""
+    pool = _get_pool(target)
+    if not pool.slots():
+        return "No accounts to test.", _render_account_table(target)
+
+    results = []
+    for slot in pool.slots():
+        try:
+            slot.provider = None
+            run_async(pool._ensure_provider(slot), timeout=60)
+            page = run_async(slot.provider._session.get_page("test"))
+            base_url = slot.provider._target.base_url
+            run_async(page.goto(base_url, wait_until="domcontentloaded", timeout=30_000))
+            logged_in = run_async(slot.provider._target.is_logged_in(page))
+            slot.logged_in = logged_in
+            slot.status = "ready" if logged_in else "ready"
+            icon = "OK" if logged_in else "NOT LOGGED IN"
+            results.append(f"{slot.label}: {icon}")
+        except Exception as exc:
+            results.append(f"{slot.label}: ERROR - {exc}")
+
+    pool._save()
+    summary = "\n".join(results)
+    return summary, _render_account_table(target)
 
 
 def do_remove_account(target: str, slot_label: str) -> tuple[str, Any]:
@@ -389,9 +417,11 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 )
                 import_btn = gr.Button("📥 Import", variant="secondary", scale=1)
 
+            test_all_btn = gr.Button("🧪 Test All Accounts", variant="primary")
+
             with gr.Row():
                 acct_select = gr.Dropdown(label="Select account", choices=[], scale=3)
-                reconnect_btn = gr.Button("🔌 Reconnect", variant="primary", scale=1)
+                reconnect_btn = gr.Button("🔌 Reconnect", variant="secondary", scale=1)
                 del_acct_btn = gr.Button("🗑 Remove", variant="stop", scale=1)
                 refresh_btn = gr.Button("🔄 Refresh", scale=1)
 
@@ -417,6 +447,11 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 do_import,
                 inputs=[target_dd, import_path_box],
                 outputs=[acct_status_txt, acct_table, acct_select],
+            )
+            test_all_btn.click(
+                do_test_all,
+                inputs=[target_dd],
+                outputs=[acct_status_txt, acct_table],
             )
             add_acct_btn.click(
                 _add,
