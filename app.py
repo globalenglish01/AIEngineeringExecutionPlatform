@@ -490,8 +490,8 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  AEEP Web UI 启动中...")
-    print("  浏览器将自动打开: http://localhost:7860")
+    print("  AEEP Web UI starting...")
+    print("  Open in browser: http://localhost:7860")
     print("=" * 60)
     demo.launch(
         server_name="127.0.0.1",
