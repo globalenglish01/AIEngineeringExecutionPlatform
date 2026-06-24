@@ -1,8 +1,9 @@
-﻿"""File tool — read, write, and list files."""
+﻿"""File tool — read, write, list files, and read CSV with column selection."""
 
 from __future__ import annotations
 
-import os
+import csv
+import io
 from pathlib import Path
 from typing import Any
 
@@ -11,19 +12,35 @@ from aeep.agents.tools.base_tool import BaseTool, ToolResult
 
 class FileTool(BaseTool):
     name = "file_tool"
-    description = "Read, write, and list files on the filesystem."
+    description = (
+        "Read, write, and list files. "
+        "Use action='read_csv' for CSV files to select specific columns and limit rows."
+    )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["read_file", "write_file", "list_files"],
+                "enum": ["read_file", "write_file", "list_files", "read_csv"],
                 "description": "The file operation to perform.",
             },
             "path": {"type": "string", "description": "File or directory path."},
             "content": {
                 "type": "string",
                 "description": "Content to write (only for write_file).",
+            },
+            "columns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Column names to include (read_csv only). Omit to get all columns.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max rows to return (read_csv only). Default 50.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Row offset to start from (read_csv only). Default 0.",
             },
         },
         "required": ["action", "path"],
@@ -34,10 +51,11 @@ class FileTool(BaseTool):
 
     def _resolve(self, path: str) -> Path:
         p = Path(path)
-        if not p.is_absolute():
-            p = self._base_dir / p
-        # Prevent path traversal outside base_dir
-        p = p.resolve()
+        if p.is_absolute():
+            # Absolute paths provided explicitly by the user are allowed as-is.
+            return p.resolve()
+        # Relative paths are resolved inside base_dir (sandbox).
+        p = (self._base_dir / p).resolve()
         try:
             p.relative_to(self._base_dir.resolve())
         except ValueError:
@@ -65,6 +83,25 @@ class FileTool(BaseTool):
                     return ToolResult(success=False, error=f"Not a directory: {path_str}")
                 entries = [e.name for e in sorted(resolved.iterdir())]
                 return ToolResult(success=True, output=entries)
+
+            elif action == "read_csv":
+                columns = args.get("columns") or []
+                limit = int(args.get("limit") or 50)
+                offset = int(args.get("offset") or 0)
+                text = resolved.read_text(encoding="utf-8-sig")
+                reader = csv.DictReader(io.StringIO(text))
+                all_rows = list(reader)
+                total = len(all_rows)
+                rows = all_rows[offset : offset + limit]
+                if columns:
+                    rows = [{c: r.get(c, "") for c in columns} for r in rows]
+                out = io.StringIO()
+                if rows:
+                    writer = csv.DictWriter(out, fieldnames=list(rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(rows)
+                summary = f"# {total} rows total, showing {offset+1}–{offset+len(rows)}\n"
+                return ToolResult(success=True, output=summary + out.getvalue())
 
             else:
                 return ToolResult(success=False, error=f"Unknown action: {action!r}")
