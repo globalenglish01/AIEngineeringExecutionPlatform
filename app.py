@@ -236,6 +236,46 @@ def do_chat(
         return history, ""
 
 
+def _extract_file_paths(text: str) -> list[str]:
+    """Extract quoted file paths from task description."""
+    import re
+    return re.findall(r'["“”]((?:[A-Za-z]:\\|/)[^""“”\n]+)["“”]', text)
+
+
+def _read_file_for_prompt(path: str, max_chars: int = 8000) -> str:
+    """Read a file and return its content, trimmed to max_chars."""
+    import csv as _csv, io as _io
+    p = Path(path)
+    if not p.exists():
+        return f"[文件不存在: {path}]"
+    if p.suffix.lower() == ".csv":
+        text = p.read_text(encoding="utf-8-sig")
+        reader = _csv.DictReader(_io.StringIO(text))
+        rows = list(reader)
+        total = len(rows)
+        # Build compact representation: word | kana | meaning (skip huge columns)
+        skip = {"ex_ja_ruby", "idiom_ruby"}
+        out_lines = []
+        header_written = False
+        chars = 0
+        for row in rows:
+            filtered = {k: v for k, v in row.items() if k not in skip}
+            if not header_written:
+                out_lines.append(",".join(filtered.keys()))
+                header_written = True
+            line = ",".join(f'"{v}"' if "," in v else v for v in filtered.values())
+            if chars + len(line) > max_chars:
+                out_lines.append(f"... (共 {total} 行，显示前 {len(out_lines)-1} 行)")
+                break
+            out_lines.append(line)
+            chars += len(line)
+        return "\n".join(out_lines)
+    raw = p.read_text(encoding="utf-8-sig", errors="replace")
+    if len(raw) > max_chars:
+        return raw[:max_chars] + f"\n... (已截断，原文 {len(raw)} 字符)"
+    return raw
+
+
 def do_agent(
     task: str,
     target: str,
@@ -246,46 +286,32 @@ def do_agent(
     if not task.strip():
         return "请先输入任务描述", ""
     try:
-        from aeep.agents.base_agent import BaseAgent
-        from aeep.agents.tools import FileTool, SearchTool, ShellTool
-
         pool = _get_pool(target)
         if pool.slot_count() == 0:
             return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
 
-        # Wrap pool as a provider-like object for BaseAgent
-        class _PoolAdapter:
-            async def complete(self, messages, model="", **kw):
-                return await pool.complete(messages, model=model, **kw)
-
-        provider = _PoolAdapter()
-        tools = []
-        if use_file:
-            tools.append(FileTool("."))
-        if use_search:
-            tools.append(SearchTool("."))
-        if use_shell:
-            tools.append(ShellTool())
-
-        agent = BaseAgent(
-            name="assistant",
-            role="你是一位专业的 AI 助手，请用中文详细回答问题。",
-            provider=provider,
-            tools=tools,
-            max_iterations=10,
-        )
-        result = run_async(agent.run(task=task, context={}), timeout=600)
-
+        # Build prompt: if file paths detected and file tool enabled, pre-read them
+        prompt = task
         steps_md = ""
-        for step in result.steps:
-            if step.thought:
-                steps_md += f"**💭 思考**\n{step.thought}\n\n"
-            if step.action and step.action != "Final Answer":
-                steps_md += f"**⚡ 行动** `{step.action}`\n```\n{step.action_input}\n```\n\n"
-            if step.observation:
-                steps_md += f"**👁 观察**\n{step.observation}\n\n---\n\n"
+        if use_file:
+            paths = _extract_file_paths(task)
+            for fp in paths:
+                content = _read_file_for_prompt(fp)
+                steps_md += f"**📂 已读取文件** `{fp}` ({len(content)} 字符)\n\n"
+                prompt += f"\n\n--- 文件内容: {fp} ---\n{content}\n--- 文件结束 ---"
 
-        return result.output or "(无输出)", steps_md
+        from aeep.core.models.message import Message, Role
+
+        async def _run():
+            return await pool.complete(
+                messages=[Message(role=Role.USER, content=prompt)],
+                model="",
+                temperature=0.7,
+                max_tokens=4096,
+            )
+
+        result = run_async(_run(), timeout=600)
+        return result.content or "(无输出)", steps_md
     except Exception as exc:
         return f"❌ 错误: {exc}", ""
 
