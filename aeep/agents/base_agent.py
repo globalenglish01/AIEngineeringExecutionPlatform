@@ -71,29 +71,56 @@ class BaseAgent:
     # Helpers
     # ------------------------------------------------------------------
 
+    # Both English and Chinese keyword variants are accepted
+    _THOUGHT_KW  = ("Thought:", "思考：", "思考:")
+    _ACTION_KW   = ("Action:", "行动：", "行动:")
+    _INPUT_KW    = ("Action Input:", "输入：", "输入:")
+    _FINAL_KW    = ("Final Answer:", "最终答案：", "最终答案:")
+
     def _parse_step(self, content: str) -> AgentStep:
-        """Parse LLM response into thought/action/finish."""
+        """Parse LLM response into thought/action/finish.
+
+        Supports both English (Thought/Action/Action Input/Final Answer)
+        and Chinese (思考/行动/输入/最终答案) keyword variants.
+        """
         step = AgentStep()
         lines = content.strip().splitlines()
+        # Collect multi-line Action Input / 输入 blocks
+        input_lines: list[str] = []
+        collecting_input = False
 
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith("Thought:"):
-                step.thought = stripped[len("Thought:"):].strip()
-            elif stripped.startswith("Action:"):
-                step.action = stripped[len("Action:"):].strip()
-            elif stripped.startswith("Action Input:"):
-                raw = stripped[len("Action Input:"):].strip()
-                try:
-                    step.action_input = json.loads(raw)
-                except (json.JSONDecodeError, ValueError):
-                    step.action_input = {"input": raw}
-            elif stripped.startswith("Final Answer:"):
-                step.thought = stripped[len("Final Answer:"):].strip()
+
+            if any(stripped.startswith(kw) for kw in self._FINAL_KW):
+                kw = next(kw for kw in self._FINAL_KW if stripped.startswith(kw))
+                step.thought = stripped[len(kw):].strip()
                 step.is_final = True
+                collecting_input = False
+            elif any(stripped.startswith(kw) for kw in self._THOUGHT_KW):
+                kw = next(kw for kw in self._THOUGHT_KW if stripped.startswith(kw))
+                step.thought = stripped[len(kw):].strip()
+                collecting_input = False
+            elif any(stripped.startswith(kw) for kw in self._ACTION_KW):
+                kw = next(kw for kw in self._ACTION_KW if stripped.startswith(kw))
+                step.action = stripped[len(kw):].strip()
+                collecting_input = False
+            elif any(stripped.startswith(kw) for kw in self._INPUT_KW):
+                kw = next(kw for kw in self._INPUT_KW if stripped.startswith(kw))
+                input_lines = [stripped[len(kw):].strip()]
+                collecting_input = True
+            elif collecting_input:
+                input_lines.append(line)
+
+        if input_lines:
+            raw = "\n".join(input_lines).strip()
+            try:
+                step.action_input = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                step.action_input = {"input": raw}
 
         if not step.action and not step.is_final:
-            # Treat entire response as final answer if no structure
+            # No structure found — treat entire response as final answer
             step.thought = content.strip()
             step.is_final = True
 
@@ -104,14 +131,15 @@ class BaseAgent:
             f"- {t.name}: {t.description}" for t in [self._registry.get(n) for n in self._registry.list_names()]
         )
         return (
-            f"You are {self.name}, {self.role}\n\n"
-            "Use the ReAct format:\n"
-            "Thought: <your reasoning>\n"
-            "Action: <tool_name or 'finish'>\n"
-            "Action Input: <JSON args>\n"
-            "...repeat until done, then:\n"
-            "Final Answer: <your final response>\n\n"
-            f"Available tools:\n{tool_descriptions or '(none)'}"
+            f"你是 {self.name}，{self.role}\n\n"
+            "请严格按照以下格式逐步完成任务，每次只输出一个步骤：\n\n"
+            "思考：<分析当前情况，决定下一步>\n"
+            "行动：<工具名称>\n"
+            "输入：<JSON格式的工具参数>\n\n"
+            "收到工具结果后继续输出下一个步骤，直到任务完成，然后输出：\n\n"
+            "最终答案：<完整的最终回复>\n\n"
+            f"可用工具：\n{tool_descriptions or '（无工具）'}\n\n"
+            "重要：每次只输出一个步骤（思考+行动+输入），等待工具结果后再继续。"
         )
 
     @property

@@ -7,6 +7,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import warnings
@@ -321,122 +322,58 @@ def do_agent(
     try:
         from aeep.core.models.message import Message, Role
 
+        from aeep.agents.base_agent import BaseAgent
+        from aeep.agents.tools import FileTool, SearchTool, ShellTool
+
+        # Build provider — browser pool or API key
         if _is_browser(target):
-            # ── 浏览器模式：分批读文件 + 逐批发送，结果追加保存 ─────────
             pool = _get_pool(target)
             if pool.slot_count() == 0:
                 return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
 
-            csv_paths = _extract_file_paths(task) if use_file else []
-            steps_md = ""
-            all_results: list[str] = []
+            class _PoolProvider:
+                async def complete(self, messages, model="", **kw):
+                    return await pool.complete(messages, model=model, **kw)
 
-            if csv_paths:
-                fp = csv_paths[0]
-                offset = 0
-                batch_num = 0
-                total = None
-                # Strip any file path mentions from task so AI sees clean instructions
-                task_core = task
-                for quoted_fp in csv_paths:
-                    task_core = task_core.replace(f'"{quoted_fp}"', "[数据见下方]")
-                    task_core = task_core.replace(f'"{quoted_fp}"', "[数据见下方]")
-                    task_core = task_core.replace(quoted_fp, "[数据见下方]")
-                while True:
-                    content, end, tot = _read_file_for_prompt(fp, offset=offset, batch_size=batch_size)
-                    if total is None:
-                        total = tot
-                    if not content or end <= offset:
-                        break
-                    batch_num += 1
-                    steps_md += f"**📦 批次 {batch_num}** 行 {offset+1}–{end} / {total}\n\n"
-                    prompt = (
-                        f"{task_core}\n\n"
-                        f"--- 数据（行 {offset+1}–{end}，共 {total} 行）---\n"
-                        f"{content}\n--- 数据结束 ---"
-                    )
-
-                    async def _run(p=prompt):
-                        return await pool.complete(
-                            messages=[Message(role=Role.USER, content=p)],
-                            model="", temperature=0.7, max_tokens=4096,
-                        )
-
-                    res = run_async(_run(), timeout=600)
-                    batch_result = res.content or ""
-                    all_results.append(f"## 批次 {batch_num}（行 {offset+1}–{end}）\n\n{batch_result}")
-                    offset = end
-                    if offset >= total:
-                        break
-
-                final_output = "\n\n---\n\n".join(all_results)
-            else:
-                # Non-CSV or no file: single shot
-                prompt = task
-                if use_file:
-                    for fp in csv_paths:
-                        content, _, _ = _read_file_for_prompt(fp)
-                        steps_md += f"**📂 文件** `{fp}`\n\n"
-                        prompt += f"\n\n--- 文件内容: {fp} ---\n{content}\n--- 文件结束 ---"
-
-                async def _run_single():
-                    return await pool.complete(
-                        messages=[Message(role=Role.USER, content=prompt)],
-                        model="", temperature=0.7, max_tokens=4096,
-                    )
-
-                res = run_async(_run_single(), timeout=600)
-                final_output = res.content or "(无输出)"
-
-            # Save to file if path given
-            out_path = save_path.strip()
-            if out_path and final_output:
-                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-                Path(out_path).write_text(final_output, encoding="utf-8")
-                steps_md += f"\n\n**💾 已保存到** `{out_path}`"
-
-            return final_output, steps_md
-
+            provider = _PoolProvider()
+            mdl = ""
         else:
-            # ── API 模式：ReAct loop + 工具 ───────────────────────────
-            from aeep.agents.base_agent import BaseAgent
-            from aeep.agents.tools import FileTool, SearchTool, ShellTool
-
             provider, mdl = _make_api_provider(target, api_key, model)
-            tools = []
-            if use_file:
-                tools.append(FileTool())
-            if use_search:
-                tools.append(SearchTool("."))
-            if use_shell:
-                tools.append(ShellTool())
 
-            agent = BaseAgent(
-                name="assistant",
-                role="你是一位专业的 AI 助手，请用中文详细回答问题。",
-                provider=provider,
-                tools=tools,
-                max_iterations=10,
-                model=mdl,
-            )
-            result = run_async(agent.run(task=task, context={}), timeout=600)
+        tools = []
+        if use_file:
+            tools.append(FileTool())
+        if use_search:
+            tools.append(SearchTool("."))
+        if use_shell:
+            tools.append(ShellTool())
 
-            steps_md = ""
-            for step in result.steps:
-                if step.thought:
-                    steps_md += f"**💭 思考**\n{step.thought}\n\n"
-                if step.action and step.action != "Final Answer":
-                    steps_md += f"**⚡ 行动** `{step.action}`\n```\n{step.action_input}\n```\n\n"
-                if step.observation:
-                    steps_md += f"**👁 观察**\n{step.observation}\n\n---\n\n"
+        agent = BaseAgent(
+            name="assistant",
+            role="你是一位专业的 AI 助手，请用中文详细回答问题。",
+            provider=provider,
+            tools=tools,
+            max_iterations=15,
+            model=mdl,
+        )
+        result = run_async(agent.run(task=task, context={}), timeout=600)
 
-            final_output = result.output or "(无输出)"
-            out_path = save_path.strip()
-            if out_path and final_output:
-                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-                Path(out_path).write_text(final_output, encoding="utf-8")
-                steps_md += f"\n\n**💾 已保存到** `{out_path}`"
-            return final_output, steps_md
+        steps_md = ""
+        for step in result.steps:
+            if step.thought:
+                steps_md += f"**💭 思考**\n{step.thought}\n\n"
+            if step.action:
+                steps_md += f"**⚡ 行动** `{step.action}`\n```json\n{json.dumps(step.action_input, ensure_ascii=False, indent=2)}\n```\n\n"
+            if step.observation:
+                steps_md += f"**👁 结果**\n{step.observation[:500]}{'...' if len(step.observation)>500 else ''}\n\n---\n\n"
+
+        final_output = result.output or "(无输出)"
+        out_path = save_path.strip()
+        if out_path and final_output:
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).write_text(final_output, encoding="utf-8")
+            steps_md += f"\n\n**💾 已保存到** `{out_path}`"
+        return final_output, steps_md
 
     except Exception as exc:
         return f"❌ 错误: {exc}", ""

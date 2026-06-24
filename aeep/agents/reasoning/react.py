@@ -55,19 +55,18 @@ class ReActLoop:
             # Loop detection
             action_counter[step.action] += 1
             if action_counter[step.action] >= _MAX_LOOP_DETECTS:
-                # Switch strategy: add a hint message
                 messages.append(Message(
                     role=Role.USER,
                     content=(
-                        f"You have called {step.action!r} {_MAX_LOOP_DETECTS} times in a row "
-                        "without making progress. Try a different approach or provide your Final Answer."
+                        f"你已经连续调用 {step.action!r} {_MAX_LOOP_DETECTS} 次但没有进展。"
+                        "请换一种方式，或者直接输出最终答案。"
                     ),
                 ))
                 action_counter.clear()
 
             # Append assistant turn + observation
             messages.append(Message(role=Role.ASSISTANT, content=self._format_step(step)))
-            messages.append(Message(role=Role.USER, content=f"Observation: {observation}"))
+            messages.append(Message(role=Role.USER, content=f"工具结果：{observation}"))
 
         return AgentResult(
             status=AgentStatus.FAILED,
@@ -91,11 +90,11 @@ class ReActLoop:
     def _format_step(step: AgentStep) -> str:
         parts = []
         if step.thought:
-            parts.append(f"Thought: {step.thought}")
+            parts.append(f"思考：{step.thought}")
         if step.action:
             import json
-            parts.append(f"Action: {step.action}")
-            parts.append(f"Action Input: {json.dumps(step.action_input)}")
+            parts.append(f"行动：{step.action}")
+            parts.append(f"输入：{json.dumps(step.action_input, ensure_ascii=False)}")
         return "\n".join(parts)
 
     @staticmethod
