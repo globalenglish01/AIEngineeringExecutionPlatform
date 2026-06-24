@@ -11,6 +11,7 @@ import logging
 import re
 from typing import Any
 
+from aeep.core.exceptions import BrowserRateLimitError
 from aeep.providers.browser.targets.base_target import BaseBrowserTarget, ExtractedResponse
 
 logger = logging.getLogger(__name__)
@@ -66,8 +67,9 @@ class ChatGPTTarget(BaseBrowserTarget):
         # Check for rate limit message
         content = await page.content()
         if _RATE_LIMIT_TEXT in content:
-            logger.warning("ChatGPT: rate limit detected")
-            return ""
+            retry = await self.handle_rate_limit(page)
+            logger.warning("ChatGPT: rate limit detected, retry_after=%ds", retry)
+            raise BrowserRateLimitError(retry_after=retry)
 
         # Grab the last assistant message
         elements = await page.query_selector_all(_RESPONSE_CONTAINER)

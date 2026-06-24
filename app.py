@@ -39,62 +39,81 @@ def run_async(coro: Any, timeout: int = 300) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Global browser provider registry (one per target, kept alive)
+# Global AccountPool registry (one pool per target)
 # ---------------------------------------------------------------------------
-_providers: dict[str, Any] = {}
-
-
 _COOKIE_DIR = Path(".browser_cookies")
+_pools: dict[str, Any] = {}   # target → AccountPool
 
 
-async def _get_provider(target: str) -> Any:
-    from aeep.providers.browser.browser_provider import BrowserProvider
-    from aeep.providers.browser.session import BrowserConfig
+def _get_pool(target: str) -> Any:
+    from aeep.providers.browser.account_pool import AccountPool
 
-    if target not in _providers:
+    if target not in _pools:
         _COOKIE_DIR.mkdir(exist_ok=True)
-        cookie_file = str(_COOKIE_DIR / f"{target}.json")
-        config = BrowserConfig(
-            headless=False,          # visible window so user can do Google login
-            cookie_path=cookie_file, # persist login across restarts
-        )
-        _providers[target] = BrowserProvider(target=target, config=config)
-    return _providers[target]
+        _pools[target] = AccountPool(target=target, cookie_dir=_COOKIE_DIR)
+    return _pools[target]
 
 
 # ---------------------------------------------------------------------------
 # UI action handlers
 # ---------------------------------------------------------------------------
 
-def do_connect(target: str) -> tuple[str, dict]:
+def do_add_account(target: str, label: str) -> tuple[str, Any]:
+    """Add a new account slot — opens a browser window for login."""
     try:
-        provider = run_async(_get_provider(target))
-        run_async(provider._ensure_initialized(), timeout=60)
-
-        # Check if cookies exist (already logged in)
-        cookie_file = _COOKIE_DIR / f"{target}.json"
-        if cookie_file.exists():
-            msg = f"已用保存的登录状态连接 {target}（Cookie 已加载，无需重新登录）"
-        else:
-            target_names = {"chatgpt": "ChatGPT", "claude_ai": "Claude.ai", "deepseek": "DeepSeek"}
-            name = target_names.get(target, target)
-            msg = (
-                f"浏览器窗口已打开！\n"
-                f"请在浏览器中登录 {name}（支持 Google 账号登录）。\n"
-                f"登录成功后，点击下方「保存登录状态」按钮，下次启动无需重新登录。"
-            )
-        return msg, gr.update(variant="secondary", value="已连接 ✓")
+        pool = _get_pool(target)
+        lbl = label.strip() or None
+        slot = run_async(pool.add_slot(lbl), timeout=60)
+        target_names = {"chatgpt": "ChatGPT", "claude_ai": "Claude.ai", "deepseek": "DeepSeek"}
+        name = target_names.get(target, target)
+        msg = (
+            f"浏览器已为「{slot.label}」打开。\n"
+            f"请在弹出窗口中登录 {name}（支持 Google 账号）。\n"
+            f"登录后点击「💾 保存登录状态」。"
+        )
+        return msg, _render_account_table(target)
     except Exception as exc:
-        return f"启动失败: {exc}", gr.update(variant="primary", value="启动浏览器")
+        return f"❌ 添加失败: {exc}", _render_account_table(target)
 
 
-def do_save_cookies(target: str) -> str:
+def do_save_cookies(target: str, slot_label: str) -> tuple[str, Any]:
     try:
-        provider = run_async(_get_provider(target))
-        run_async(provider._session.save_cookies())
-        return "✅ 登录状态已保存！下次启动自动复用，无需重新登录。"
+        pool = _get_pool(target)
+        for slot in pool.slots():
+            if slot.label == slot_label:
+                run_async(pool.save_cookies(slot.index))
+                return f"✅ 「{slot_label}」登录状态已保存，下次启动自动复用。", _render_account_table(target)
+        return "❌ 未找到该账号", _render_account_table(target)
     except Exception as exc:
-        return f"❌ 保存失败: {exc}"
+        return f"❌ 保存失败: {exc}", _render_account_table(target)
+
+
+def do_remove_account(target: str, slot_label: str) -> tuple[str, Any]:
+    try:
+        pool = _get_pool(target)
+        for slot in pool.slots():
+            if slot.label == slot_label:
+                run_async(pool.remove_slot(slot.index))
+                return f"✅ 已删除账号「{slot_label}」", _render_account_table(target)
+        return "❌ 未找到该账号", _render_account_table(target)
+    except Exception as exc:
+        return f"❌ 删除失败: {exc}", _render_account_table(target)
+
+
+def do_refresh_status(target: str) -> Any:
+    return _render_account_table(target)
+
+
+def _render_account_table(target: str) -> Any:
+    pool = _get_pool(target)
+    rows = pool.status_table()
+    if not rows:
+        return gr.update(value=None)
+    return gr.update(value=rows)
+
+
+def _slot_labels(target: str) -> list[str]:
+    return [s.label for s in _get_pool(target).slots()]
 
 
 def do_chat(
@@ -106,19 +125,24 @@ def do_chat(
         return history, ""
     try:
         from aeep.core.models.message import Message, Role
+        from aeep.providers.browser.account_pool import AllAccountsCoolingError
 
-        provider = run_async(_get_provider(target))
+        pool = _get_pool(target)
+        if pool.slot_count() == 0:
+            history = history + [[user_msg, "⚠️ 请先在「账号管理」Tab 添加至少一个账号"]]
+            return history, ""
+
         messages: list[Message] = []
         for pair in history:
             messages.append(Message(role=Role.USER, content=pair[0]))
             messages.append(Message(role=Role.ASSISTANT, content=pair[1]))
         messages.append(Message(role=Role.USER, content=user_msg))
 
-        result = run_async(provider.complete(messages), timeout=300)
+        result = run_async(pool.complete(messages), timeout=300)
         history = history + [[user_msg, result.content]]
         return history, ""
     except Exception as exc:
-        history = history + [[user_msg, f"❌ 错误: {exc}"]]
+        history = history + [[user_msg, f"❌ {exc}"]]
         return history, ""
 
 
@@ -135,7 +159,16 @@ def do_agent(
         from aeep.agents.base_agent import BaseAgent
         from aeep.agents.tools import FileTool, SearchTool, ShellTool
 
-        provider = run_async(_get_provider(target))
+        pool = _get_pool(target)
+        if pool.slot_count() == 0:
+            return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
+
+        # Wrap pool as a provider-like object for BaseAgent
+        class _PoolAdapter:
+            async def complete(self, messages, model="", **kw):
+                return await pool.complete(messages, model=model, **kw)
+
+        provider = _PoolAdapter()
         tools = []
         if use_file:
             tools.append(FileTool("."))
@@ -248,21 +281,87 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             label="选择 AI 目标",
             scale=2,
         )
-        connect_btn = gr.Button("🚀 启动浏览器", variant="primary", scale=1)
-        save_btn = gr.Button("💾 保存登录状态", variant="secondary", scale=1)
         status_txt = gr.Textbox(
-            value="尚未连接 — 点击「启动浏览器」，在弹出窗口中用 Google 账号登录",
+            value="请在「账号管理」Tab 添加账号后开始使用",
             label="状态",
             interactive=False,
-            scale=4,
+            scale=5,
             elem_classes=["status-bar"],
         )
 
-    connect_btn.click(do_connect, inputs=[target_dd], outputs=[status_txt, connect_btn])
-    save_btn.click(do_save_cookies, inputs=[target_dd], outputs=[status_txt])
-
     # ---------- 功能标签页 ----------
     with gr.Tabs():
+
+        # ── Tab 0: 账号管理 ────────────────────────────────────────────
+        with gr.Tab("👥 账号管理"):
+            gr.Markdown(
+                "每个账号对应一个独立的浏览器会话。"
+                "当某账号达到使用限制时，系统**自动切换**到下一个可用账号。"
+            )
+            with gr.Row():
+                acct_label_box = gr.Textbox(
+                    label="账号备注名（可选）",
+                    placeholder="例：Google账号1、工作账号…",
+                    scale=3,
+                )
+                add_acct_btn = gr.Button("➕ 添加账号", variant="primary", scale=1)
+
+            acct_status_txt = gr.Textbox(
+                label="操作状态",
+                interactive=False,
+                value="",
+            )
+            acct_table = gr.Dataframe(
+                headers=["序号", "账号", "状态", "Cookie"],
+                label="当前账号池",
+                interactive=False,
+                row_count=(1, "dynamic"),
+            )
+
+            with gr.Row():
+                acct_select = gr.Dropdown(label="选择账号（保存/删除）", choices=[], scale=3)
+                save_acct_btn = gr.Button("💾 保存登录状态", variant="secondary", scale=1)
+                del_acct_btn = gr.Button("🗑 删除账号", variant="stop", scale=1)
+                refresh_btn = gr.Button("🔄 刷新状态", scale=1)
+
+            def _add(target, label):
+                msg, table = do_add_account(target, label)
+                choices = _slot_labels(target)
+                return msg, table, gr.update(choices=choices, value=choices[-1] if choices else None)
+
+            def _save(target, lbl):
+                msg, table = do_save_cookies(target, lbl)
+                return msg, table
+
+            def _del(target, lbl):
+                msg, table = do_remove_account(target, lbl)
+                choices = _slot_labels(target)
+                return msg, table, gr.update(choices=choices, value=choices[0] if choices else None)
+
+            def _refresh(target):
+                choices = _slot_labels(target)
+                return _render_account_table(target), gr.update(choices=choices)
+
+            add_acct_btn.click(
+                _add,
+                inputs=[target_dd, acct_label_box],
+                outputs=[acct_status_txt, acct_table, acct_select],
+            )
+            save_acct_btn.click(
+                _save,
+                inputs=[target_dd, acct_select],
+                outputs=[acct_status_txt, acct_table],
+            )
+            del_acct_btn.click(
+                _del,
+                inputs=[target_dd, acct_select],
+                outputs=[acct_status_txt, acct_table, acct_select],
+            )
+            refresh_btn.click(
+                _refresh,
+                inputs=[target_dd],
+                outputs=[acct_table, acct_select],
+            )
 
         # ── Tab 1: 对话 ──────────────────────────────────────────────
         with gr.Tab("💬 对话"):
@@ -347,15 +446,22 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             gr.Markdown("""
 ## 快速开始（首次）
 
-1. **选择 AI 目标**（顶部下拉菜单）
-2. **点击「🚀 启动浏览器」** — 会弹出一个可见的 Chromium 窗口
-3. **在弹出窗口中登录**：支持用 **Google 账号** 登录 ChatGPT / Claude.ai / DeepSeek
-4. 登录成功后，点击 **「💾 保存登录状态」** — Cookie 保存到本地，**下次无需重登录**
-5. 回到此页面，开始对话或使用 Agent
+1. **选择 AI 目标**（顶部下拉）：ChatGPT / Claude.ai / DeepSeek
+2. 进入 **「👥 账号管理」Tab**，点 **「➕ 添加账号」**
+3. 在弹出的浏览器窗口中，**用 Google 账号登录**对应网站
+4. 回到管理 Tab，点 **「💾 保存登录状态」** — 下次无需重新登录
+5. 重复 2-4 步骤可**添加多个账号**，达到限额时自动轮转
 
-## 再次启动（已登录）
+## 多账号轮转机制
 
-直接点「🚀 启动浏览器」，系统自动加载上次保存的登录状态，无需再次登录。
+- 系统按**轮询**顺序使用账号
+- 某账号触发限额时，**自动标为冷却**并切换到下一个
+- 冷却结束后自动恢复为可用状态
+- 账号池里所有账号都冷却时，会返回等待时间提示
+
+## 再次启动（已保存 Cookie）
+
+直接添加账号（Cookie 自动加载），无需重新登录。
 
 ---
 

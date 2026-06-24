@@ -10,6 +10,7 @@ import logging
 import re
 from typing import Any
 
+from aeep.core.exceptions import BrowserRateLimitError
 from aeep.providers.browser.targets.base_target import BaseBrowserTarget, ExtractedResponse
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,9 @@ class ClaudeAITarget(BaseBrowserTarget):
 
         content = await page.content()
         if _RATE_LIMIT_TEXT in content.lower():
-            logger.warning("Claude.ai: usage limit detected")
-            return ""
+            retry = await self.handle_rate_limit(page)
+            logger.warning("Claude.ai: usage limit detected, retry_after=%ds", retry)
+            raise BrowserRateLimitError(retry_after=retry)
 
         elements = await page.query_selector_all(_RESPONSE_CONTAINER)
         if not elements:

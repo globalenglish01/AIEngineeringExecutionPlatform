@@ -11,7 +11,13 @@ import time
 import uuid
 from typing import AsyncIterator
 
-from aeep.core.exceptions import BrowserInitError, BrowserSessionError, ProviderError
+from aeep.core.exceptions import (
+    BrowserInitError,
+    BrowserRateLimitError,
+    BrowserSessionError,
+    ProviderError,
+    ProviderRateLimitError,
+)
 from aeep.core.interfaces.provider import HealthCheckResult, HealthStatus, ProviderType
 from aeep.core.models.message import CompletionResult, Message, Role, StreamChunk
 from aeep.providers.base import BaseLLMProvider
@@ -130,6 +136,9 @@ class BaseBrowserProvider(BaseLLMProvider):
                     duration_ms=duration_ms,
                 )
 
+            except BrowserRateLimitError as exc:
+                # Propagate rate limit immediately — AccountPool will rotate accounts
+                raise ProviderRateLimitError(self.name, retry_after=exc.retry_after) from exc
             except BrowserSessionError as exc:
                 last_exc = exc
                 logger.warning(

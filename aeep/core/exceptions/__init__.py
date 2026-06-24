@@ -49,6 +49,14 @@ class BrowserSessionError(PlatformError):
     pass
 
 
+class BrowserRateLimitError(BrowserSessionError):
+    """Raised by a browser target when the site enforces a usage limit."""
+
+    def __init__(self, retry_after: int = 60) -> None:
+        self.retry_after = retry_after
+        super().__init__(f"Rate limited — retry after {retry_after}s")
+
+
 class ValidationError(PlatformError):
     pass
 
@@ -73,6 +81,7 @@ __all__ = [
     "AllProvidersFailedError",
     "BrowserInitError",
     "BrowserLoginError",
+    "BrowserRateLimitError",
     "BrowserSessionError",
     "CircuitBreakerOpenError",
     "ConfigError",

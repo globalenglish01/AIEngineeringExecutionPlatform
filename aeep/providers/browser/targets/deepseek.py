@@ -10,6 +10,7 @@ import logging
 import re
 from typing import Any
 
+from aeep.core.exceptions import BrowserRateLimitError
 from aeep.providers.browser.targets.base_target import BaseBrowserTarget, ExtractedResponse
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ class DeepSeekTarget(BaseBrowserTarget):
         content = await page.content()
         if _RATE_LIMIT_TEXT in content:
             logger.warning("DeepSeek: rate limit detected")
-            return ""
+            raise BrowserRateLimitError(retry_after=3600)
 
         elements = await page.query_selector_all(_RESPONSE_CONTAINER)
         if not elements:
