@@ -72,7 +72,7 @@ class AccountSlot:
             "no": self.index + 1,
             "account": self.label,
             "status": status_display,
-            "cookie": "saved" if Path(self.cookie_path).exists() else "not saved",
+            "cookie": "saved" if Path(self.cookie_path).exists() else "pending login",
         }
 
 
@@ -99,15 +99,21 @@ class AccountPool:
         from aeep.providers.browser.session import BrowserConfig
 
         idx = len(self._slots)
-        lbl = label or f"账号{idx + 1}"
+        lbl = label or f"account{idx + 1}"
+        # Each slot gets its own persistent Chrome profile — passes Google OAuth
+        user_data_dir = str(self.cookie_dir / f"{self.target}_{idx}_profile")
         cookie_path = str(self.cookie_dir / f"{self.target}_{idx}.json")
 
-        config = BrowserConfig(headless=False, cookie_path=cookie_path)
+        config = BrowserConfig(
+            headless=False,
+            user_data_dir=user_data_dir,
+            cookie_path=cookie_path,
+        )
         provider = BrowserProvider(target=self.target, config=config,
                                    name=f"{self.target}_{idx}")
         await provider._ensure_initialized()
 
-        # Navigate to the login page so the browser window is visible to the user
+        # Navigate to login page so the window is visible and user can sign in
         page = await provider._session.get_page("login")
         await page.goto(
             provider._target.base_url,
@@ -116,8 +122,8 @@ class AccountPool:
         )
         await page.bring_to_front()
 
-        slot = AccountSlot(index=idx, label=lbl, cookie_path=cookie_path,
-                           status="就绪", provider=provider)
+        slot = AccountSlot(index=idx, label=lbl, cookie_path=user_data_dir,
+                           status="ready", provider=provider)
         self._slots.append(slot)
         logger.info("AccountPool[%s]: added slot '%s' (index=%d)", self.target, lbl, idx)
         return slot
