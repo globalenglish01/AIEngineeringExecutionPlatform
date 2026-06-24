@@ -479,6 +479,12 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 inputs=[target_dd],
                 outputs=[acct_table, acct_select],
             )
+            # Auto-populate table on page load / refresh
+            demo.load(
+                _refresh,
+                inputs=[target_dd],
+                outputs=[acct_table, acct_select],
+            )
             # Inline rename: outputs to status text only (not back to table) to avoid loop
             acct_table.change(
                 do_rename_from_table,
