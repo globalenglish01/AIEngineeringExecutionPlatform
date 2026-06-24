@@ -188,15 +188,37 @@ class BaseBrowserProvider(BaseLLMProvider):
                 raise BrowserInitError(str(exc)) from exc
 
     def _messages_to_prompt(self, messages: list[Message]) -> str:
-        """Flatten message list into a single prompt string for the web UI."""
-        parts: list[str] = []
+        """Flatten message list into a single prompt string for the web UI.
+
+        System messages are prepended to the first user message rather than
+        sent as a separate turn — browser UIs have no system-prompt field.
+        """
+        system_parts: list[str] = []
+        non_system: list[Message] = []
         for m in messages:
             if m.role == Role.SYSTEM:
-                parts.append(f"[System]\n{m.content}")
-            elif m.role == Role.USER:
-                parts.append(m.content)
+                system_parts.append(m.content)
+            else:
+                non_system.append(m)
+
+        parts: list[str] = []
+        first_user_done = False
+        for m in non_system:
+            if m.role == Role.USER:
+                if not first_user_done and system_parts:
+                    # Merge system context into the first user message
+                    system_block = "\n\n".join(system_parts)
+                    parts.append(f"{system_block}\n\n{m.content}")
+                    first_user_done = True
+                else:
+                    parts.append(m.content)
             elif m.role == Role.ASSISTANT:
-                parts.append(f"[Previous assistant response]\n{m.content}")
+                parts.append(f"[Assistant]\n{m.content}")
+
+        # Edge case: only system messages, no user turn yet
+        if not parts and system_parts:
+            parts.append("\n\n".join(system_parts))
+
         return "\n\n".join(parts)
 
     async def close(self) -> None:
