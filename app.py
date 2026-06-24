@@ -206,21 +206,41 @@ def _slot_labels(target: str) -> list[str]:
     return [s.label for s in _get_pool(target).slots()]
 
 
+_BROWSER_TARGETS = {"chatgpt", "claude_ai", "deepseek"}
+
+
+def _is_browser(target: str) -> bool:
+    return target in _BROWSER_TARGETS
+
+
+def _make_api_provider(target: str, api_key: str, model: str):
+    """Instantiate the correct API provider from target name."""
+    key = api_key.strip()
+    if not key:
+        raise ValueError("请填写 API Key")
+    if target == "api_openai":
+        from aeep.providers.api.openai_provider import OpenAIProvider
+        return OpenAIProvider(api_key=key), model or "gpt-4o-mini"
+    if target == "api_anthropic":
+        from aeep.providers.api.anthropic_provider import AnthropicProvider
+        return AnthropicProvider(api_key=key), model or "claude-haiku-4-5-20251001"
+    if target == "api_deepseek":
+        from aeep.providers.api.deepseek_provider import DeepSeekProvider
+        return DeepSeekProvider(api_key=key), model or "deepseek-chat"
+    raise ValueError(f"Unknown API target: {target}")
+
+
 def do_chat(
     user_msg: str,
     history: list[list[str]],
     target: str,
+    api_key: str = "",
+    model: str = "",
 ) -> tuple[list[list[str]], str]:
     if not user_msg.strip():
         return history, ""
     try:
         from aeep.core.models.message import Message, Role
-        from aeep.providers.browser.account_pool import AllAccountsCoolingError
-
-        pool = _get_pool(target)
-        if pool.slot_count() == 0:
-            history = history + [[user_msg, "⚠️ 请先在「账号管理」Tab 添加至少一个账号"]]
-            return history, ""
 
         messages: list[Message] = []
         for pair in history:
@@ -228,7 +248,17 @@ def do_chat(
             messages.append(Message(role=Role.ASSISTANT, content=pair[1]))
         messages.append(Message(role=Role.USER, content=user_msg))
 
-        result = run_async(pool.complete(messages), timeout=300)
+        if _is_browser(target):
+            from aeep.providers.browser.account_pool import AllAccountsCoolingError
+            pool = _get_pool(target)
+            if pool.slot_count() == 0:
+                history = history + [[user_msg, "⚠️ 请先在「账号管理」Tab 添加至少一个账号"]]
+                return history, ""
+            result = run_async(pool.complete(messages), timeout=300)
+        else:
+            provider, mdl = _make_api_provider(target, api_key, model)
+            result = run_async(provider.complete(messages, model=mdl), timeout=300)
+
         history = history + [[user_msg, result.content]]
         return history, ""
     except Exception as exc:
@@ -282,36 +312,71 @@ def do_agent(
     use_file: bool,
     use_search: bool,
     use_shell: bool,
+    api_key: str = "",
+    model: str = "",
 ) -> tuple[str, str]:
     if not task.strip():
         return "请先输入任务描述", ""
     try:
-        pool = _get_pool(target)
-        if pool.slot_count() == 0:
-            return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
-
-        # Build prompt: if file paths detected and file tool enabled, pre-read them
-        prompt = task
-        steps_md = ""
-        if use_file:
-            paths = _extract_file_paths(task)
-            for fp in paths:
-                content = _read_file_for_prompt(fp)
-                steps_md += f"**📂 已读取文件** `{fp}` ({len(content)} 字符)\n\n"
-                prompt += f"\n\n--- 文件内容: {fp} ---\n{content}\n--- 文件结束 ---"
-
         from aeep.core.models.message import Message, Role
 
-        async def _run():
-            return await pool.complete(
-                messages=[Message(role=Role.USER, content=prompt)],
-                model="",
-                temperature=0.7,
-                max_tokens=4096,
-            )
+        if _is_browser(target):
+            # ── 浏览器模式：直接读文件 + 单次发送 ──────────────────────
+            pool = _get_pool(target)
+            if pool.slot_count() == 0:
+                return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
 
-        result = run_async(_run(), timeout=600)
-        return result.content or "(无输出)", steps_md
+            prompt = task
+            steps_md = ""
+            if use_file:
+                for fp in _extract_file_paths(task):
+                    content = _read_file_for_prompt(fp)
+                    steps_md += f"**📂 已读取文件** `{fp}` ({len(content)} 字符)\n\n"
+                    prompt += f"\n\n--- 文件内容: {fp} ---\n{content}\n--- 文件结束 ---"
+
+            async def _run_browser():
+                return await pool.complete(
+                    messages=[Message(role=Role.USER, content=prompt)],
+                    model="", temperature=0.7, max_tokens=4096,
+                )
+
+            result = run_async(_run_browser(), timeout=600)
+            return result.content or "(无输出)", steps_md
+
+        else:
+            # ── API 模式：ReAct loop + 工具 ───────────────────────────
+            from aeep.agents.base_agent import BaseAgent
+            from aeep.agents.tools import FileTool, SearchTool, ShellTool
+
+            provider, mdl = _make_api_provider(target, api_key, model)
+            tools = []
+            if use_file:
+                tools.append(FileTool())
+            if use_search:
+                tools.append(SearchTool("."))
+            if use_shell:
+                tools.append(ShellTool())
+
+            agent = BaseAgent(
+                name="assistant",
+                role="你是一位专业的 AI 助手，请用中文详细回答问题。",
+                provider=provider,
+                tools=tools,
+                max_iterations=10,
+                model=mdl,
+            )
+            result = run_async(agent.run(task=task, context={}), timeout=600)
+
+            steps_md = ""
+            for step in result.steps:
+                if step.thought:
+                    steps_md += f"**💭 思考**\n{step.thought}\n\n"
+                if step.action and step.action != "Final Answer":
+                    steps_md += f"**⚡ 行动** `{step.action}`\n```\n{step.action_input}\n```\n\n"
+                if step.observation:
+                    steps_md += f"**👁 观察**\n{step.observation}\n\n---\n\n"
+            return result.output or "(无输出)", steps_md
+
     except Exception as exc:
         return f"❌ 错误: {exc}", ""
 
@@ -375,9 +440,12 @@ footer { display: none !important; }
 """
 
 TARGET_CHOICES = [
-    ("ChatGPT (chat.openai.com)", "chatgpt"),
-    ("Claude.ai (claude.ai)", "claude_ai"),
-    ("DeepSeek (chat.deepseek.com)", "deepseek"),
+    ("🌐 ChatGPT (浏览器·免费)", "chatgpt"),
+    ("🌐 Claude.ai (浏览器·免费)", "claude_ai"),
+    ("🌐 DeepSeek (浏览器·免费)", "deepseek"),
+    ("🔑 OpenAI API", "api_openai"),
+    ("🔑 Anthropic API", "api_anthropic"),
+    ("🔑 DeepSeek API", "api_deepseek"),
 ]
 
 with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
@@ -404,6 +472,26 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             scale=5,
             elem_classes=["status-bar"],
         )
+
+    # API Key row (only visible when an API target is selected)
+    with gr.Row(visible=False) as api_key_row:
+        api_key_box = gr.Textbox(
+            label="API Key",
+            placeholder="sk-... 或 sk-ant-...",
+            type="password",
+            scale=3,
+        )
+        api_model_box = gr.Textbox(
+            label="模型（可留空用默认）",
+            placeholder="gpt-4o-mini / claude-haiku-4-5-20251001 / deepseek-chat",
+            scale=3,
+        )
+
+    def _on_target_change(tgt):
+        is_api = not _is_browser(tgt)
+        return gr.update(visible=is_api)
+
+    target_dd.change(_on_target_change, inputs=[target_dd], outputs=[api_key_row])
 
     # ---------- 功能标签页 ----------
     with gr.Tabs():
@@ -531,17 +619,17 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 send_btn = gr.Button("发送", variant="primary", scale=1)
                 clear_btn = gr.Button("清空", scale=1)
 
-            def _send(msg, hist, tgt):
-                return do_chat(msg, hist, tgt)
+            def _send(msg, hist, tgt, key, mdl):
+                return do_chat(msg, hist, tgt, api_key=key, model=mdl)
 
             send_btn.click(
                 _send,
-                inputs=[chat_input, chatbot, target_dd],
+                inputs=[chat_input, chatbot, target_dd, api_key_box, api_model_box],
                 outputs=[chatbot, chat_input],
             )
             chat_input.submit(
                 _send,
-                inputs=[chat_input, chatbot, target_dd],
+                inputs=[chat_input, chatbot, target_dd, api_key_box, api_model_box],
                 outputs=[chatbot, chat_input],
             )
             clear_btn.click(lambda: ([], ""), outputs=[chatbot, chat_input])
@@ -549,12 +637,12 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
         # ── Tab 2: Agent 模式 ─────────────────────────────────────────
         with gr.Tab("🤖 Agent 模式"):
             gr.Markdown(
-                "Agent 会自主分析任务、调用工具（文件读写、代码搜索、Shell）、"
-                "循环推理直到得出答案。"
+                "**浏览器模式**：直接读取文件后一次性发给 AI（稳定）\n\n"
+                "**API 模式**：AI 自主调用工具循环推理直到完成任务（功能更强）"
             )
             task_box = gr.Textbox(
                 label="任务描述",
-                placeholder="例：分析 aeep/validation/ 目录的代码架构，输出设计摘要",
+                placeholder="例：为\"C:\\path\\to\\file.csv\"中的单词生成记忆方法",
                 lines=4,
             )
             with gr.Row():
@@ -564,11 +652,12 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             run_agent_btn = gr.Button("▶ 运行 Agent", variant="primary")
             with gr.Row():
                 agent_out = gr.Textbox(label="最终答案", lines=12, scale=3)
-                agent_steps = gr.Markdown(label="推理过程", scale=2)
+                agent_steps = gr.Markdown(label="推理过程 / 文件预处理", scale=2)
 
             run_agent_btn.click(
                 do_agent,
-                inputs=[task_box, target_dd, chk_file, chk_search, chk_shell],
+                inputs=[task_box, target_dd, chk_file, chk_search, chk_shell,
+                        api_key_box, api_model_box],
                 outputs=[agent_out, agent_steps],
             )
 
