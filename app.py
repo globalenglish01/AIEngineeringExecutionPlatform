@@ -50,12 +50,19 @@ _COOKIE_DIR = Path(".browser_cookies")
 _pools: dict[str, Any] = {}   # target → AccountPool
 
 
+_ACCOUNTS_FILE = _COOKIE_DIR / "accounts.json"
+
+
 def _get_pool(target: str) -> Any:
     from aeep.providers.browser.account_pool import AccountPool
 
     if target not in _pools:
         _COOKIE_DIR.mkdir(exist_ok=True)
-        _pools[target] = AccountPool(target=target, cookie_dir=_COOKIE_DIR)
+        _pools[target] = AccountPool(
+            target=target,
+            cookie_dir=_COOKIE_DIR,
+            accounts_file=_ACCOUNTS_FILE,
+        )
     return _pools[target]
 
 
@@ -81,16 +88,23 @@ def do_add_account(target: str, label: str) -> tuple[str, Any]:
         return f"❌ 添加失败: {exc}", _render_account_table(target)
 
 
-def do_save_cookies(target: str, slot_label: str) -> tuple[str, Any]:
+def do_reconnect(target: str, slot_label: str) -> tuple[str, Any]:
+    """Reopen the browser for an existing account (e.g. after page refresh)."""
     try:
         pool = _get_pool(target)
         for slot in pool.slots():
             if slot.label == slot_label:
-                run_async(pool.save_cookies(slot.index))
-                return f"✅ 「{slot_label}」登录状态已保存，下次启动自动复用。", _render_account_table(target)
-        return "❌ 未找到该账号", _render_account_table(target)
+                slot.provider = None   # force re-init
+                run_async(pool._ensure_provider(slot), timeout=60)
+                page = run_async(slot.provider._session.get_page("login"))
+                try:
+                    run_async(page.bring_to_front())
+                except Exception:
+                    pass
+                return f"Browser reopened for '{slot_label}'. If not logged in, sign in now.", _render_account_table(target)
+        return "Account not found.", _render_account_table(target)
     except Exception as exc:
-        return f"❌ 保存失败: {exc}", _render_account_table(target)
+        return f"Reconnect failed: {exc}", _render_account_table(target)
 
 
 def do_remove_account(target: str, slot_label: str) -> tuple[str, Any]:
@@ -328,18 +342,18 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
             )
 
             with gr.Row():
-                acct_select = gr.Dropdown(label="选择账号（保存/删除）", choices=[], scale=3)
-                save_acct_btn = gr.Button("💾 保存登录状态", variant="secondary", scale=1)
-                del_acct_btn = gr.Button("🗑 删除账号", variant="stop", scale=1)
-                refresh_btn = gr.Button("🔄 刷新状态", scale=1)
+                acct_select = gr.Dropdown(label="Select account", choices=[], scale=3)
+                reconnect_btn = gr.Button("🔌 Reconnect", variant="primary", scale=1)
+                del_acct_btn = gr.Button("🗑 Remove", variant="stop", scale=1)
+                refresh_btn = gr.Button("🔄 Refresh", scale=1)
 
             def _add(target, label):
                 msg, _ = do_add_account(target, label)
                 choices = _slot_labels(target)
                 return msg, _render_account_table(target), gr.update(choices=choices, value=choices[-1] if choices else None)
 
-            def _save(target, lbl):
-                msg, _ = do_save_cookies(target, lbl)
+            def _reconnect(target, lbl):
+                msg, _ = do_reconnect(target, lbl)
                 return msg, _render_account_table(target)
 
             def _del(target, lbl):
@@ -356,8 +370,8 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 inputs=[target_dd, acct_label_box],
                 outputs=[acct_status_txt, acct_table, acct_select],
             )
-            save_acct_btn.click(
-                _save,
+            reconnect_btn.click(
+                _reconnect,
                 inputs=[target_dd, acct_select],
                 outputs=[acct_status_txt, acct_table],
             )
@@ -367,6 +381,12 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 outputs=[acct_status_txt, acct_table, acct_select],
             )
             refresh_btn.click(
+                _refresh,
+                inputs=[target_dd],
+                outputs=[acct_table, acct_select],
+            )
+            # Reload table when switching target
+            target_dd.change(
                 _refresh,
                 inputs=[target_dd],
                 outputs=[acct_table, acct_select],
