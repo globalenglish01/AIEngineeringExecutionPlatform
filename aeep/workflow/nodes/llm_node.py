@@ -28,11 +28,6 @@ class LLMNode(BaseNode):
     node_type = "llm"
 
     async def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        from aeep.providers.registry import get_registry
-
-        registry = get_registry()
-
-        provider_name: str = self._get(context, "provider_name", "")
         model: str = self.config.get("model", context.get("default_model", ""))
         template_str: str = self.config.get("prompt_template", "")
         system_prompt: str = self.config.get("system_prompt", "")
@@ -48,10 +43,18 @@ class LLMNode(BaseNode):
             messages.append(Message(role=Role.SYSTEM, content=system_prompt))
         messages.append(Message(role=Role.USER, content=prompt))
 
-        logger.info("LLMNode '%s': calling provider '%s'", self.node_id, provider_name)
-
-        provider = registry.get(provider_name)
-        result = await provider.complete(messages, model=model, temperature=temperature, max_tokens=max_tokens)
+        # Allow direct provider injection via context (e.g. Browser LLM pool)
+        direct_provider = context.get("_provider")
+        if direct_provider is not None:
+            logger.info("LLMNode '%s': using injected provider", self.node_id)
+            result = await direct_provider.complete(messages, model=model)
+        else:
+            from aeep.providers.registry import get_registry
+            provider_name: str = self._get(context, "provider_name", "")
+            registry = get_registry()
+            logger.info("LLMNode '%s': calling registry provider '%s'", self.node_id, provider_name)
+            provider = registry.get(provider_name)
+            result = await provider.complete(messages, model=model, temperature=temperature, max_tokens=max_tokens)
 
         logger.info(
             "LLMNode '%s': received %d tokens in %dms",

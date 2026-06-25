@@ -6,9 +6,16 @@ Run:
 
 from __future__ import annotations
 
+import sys
+from unittest.mock import MagicMock
+
+# xxhash DLL is blocked by security policy on this machine — mock it before
+# any LangChain/LangSmith import chain tries to load the broken native extension.
+if "xxhash" not in sys.modules:
+    sys.modules["xxhash"] = MagicMock()
+
 import asyncio
 import json
-import sys
 import threading
 import warnings
 from pathlib import Path
@@ -231,6 +238,41 @@ def _make_api_provider(target: str, api_key: str, model: str):
     raise ValueError(f"Unknown API target: {target}")
 
 
+def _make_lc_api_model(target: str, api_key: str, model: str) -> Any:
+    """Wrap an AEEP API provider as a LangChain BaseChatModel."""
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage, BaseMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from aeep.core.models.message import Message, Role as ARole
+
+    provider, mdl = _make_api_provider(target, api_key, model)
+
+    _role_map = {"human": ARole.USER, "ai": ARole.ASSISTANT, "system": ARole.SYSTEM}
+
+    class _ApiChatModel(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return f"aeep-api-{target}"
+
+        def _generate(self, messages: list[BaseMessage], stop=None, run_manager=None, **kw) -> ChatResult:
+            msgs = [Message(role=_role_map.get(m.type, ARole.USER), content=m.content if isinstance(m.content, str) else str(m.content)) for m in messages]
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(provider.complete(msgs, model=mdl))
+            finally:
+                loop.close()
+            text = result.content or ""
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
+
+        async def _agenerate(self, messages: list[BaseMessage], stop=None, run_manager=None, **kw) -> ChatResult:
+            msgs = [Message(role=_role_map.get(m.type, ARole.USER), content=m.content if isinstance(m.content, str) else str(m.content)) for m in messages]
+            result = await provider.complete(msgs, model=mdl)
+            text = result.content or ""
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
+
+    return _ApiChatModel()
+
+
 def do_chat(
     user_msg: str,
     history: list[list[str]],
@@ -320,63 +362,288 @@ def do_agent(
     if not task.strip():
         return "请先输入任务描述", ""
     try:
-        from aeep.core.models.message import Message, Role
-
-        from aeep.agents.base_agent import BaseAgent
-        from aeep.agents.tools import FileTool, SearchTool, ShellTool
-
-        # Build provider — browser pool or API key
-        if _is_browser(target):
-            pool = _get_pool(target)
-            if pool.slot_count() == 0:
-                return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
-
-            class _PoolProvider:
-                async def complete(self, messages, model="", **kw):
-                    return await pool.complete(messages, model=model, **kw)
-
-            provider = _PoolProvider()
-            mdl = ""
-        else:
-            provider, mdl = _make_api_provider(target, api_key, model)
-
-        tools = []
-        if use_file:
-            tools.append(FileTool())
-        if use_search:
-            tools.append(SearchTool("."))
-        if use_shell:
-            tools.append(ShellTool())
-
-        agent = BaseAgent(
-            name="assistant",
-            role="你是一位专业的 AI 助手，请用中文详细回答问题。",
-            provider=provider,
-            tools=tools,
-            max_iterations=15,
-            model=mdl,
+        return run_async(
+            _agent_lc(
+                task=task,
+                target=target,
+                use_file=use_file,
+                use_search=use_search,
+                use_shell=use_shell,
+                api_key=api_key,
+                model=model,
+                save_path=save_path,
+            ),
+            timeout=600,
         )
-        result = run_async(agent.run(task=task, context={}), timeout=600)
-
-        steps_md = ""
-        for step in result.steps:
-            if step.thought:
-                steps_md += f"**💭 思考**\n{step.thought}\n\n"
-            if step.action:
-                steps_md += f"**⚡ 行动** `{step.action}`\n```json\n{json.dumps(step.action_input, ensure_ascii=False, indent=2)}\n```\n\n"
-            if step.observation:
-                steps_md += f"**👁 结果**\n{step.observation[:500]}{'...' if len(step.observation)>500 else ''}\n\n---\n\n"
-
-        final_output = result.output or "(无输出)"
-        out_path = save_path.strip()
-        if out_path and final_output:
-            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(out_path).write_text(final_output, encoding="utf-8")
-            steps_md += f"\n\n**💾 已保存到** `{out_path}`"
-        return final_output, steps_md
-
     except Exception as exc:
-        return f"❌ 错误: {exc}", ""
+        import traceback
+        return f"❌ 错误: {exc}\n{traceback.format_exc()}", ""
+
+
+async def _agent_lc(
+    task: str,
+    target: str,
+    use_file: bool,
+    use_search: bool,
+    use_shell: bool,
+    api_key: str,
+    model: str,
+    save_path: str,
+) -> tuple[str, str]:
+    """LangGraph create_react_agent — works for both browser and API providers."""
+    import re as _re
+
+    from langchain.agents import create_agent as create_react_agent
+    from langchain_core.tools import tool as lc_tool
+    from langchain_core.messages import HumanMessage
+
+    from aeep.agents.tools import FileTool, SearchTool, ShellTool
+
+    # ── 1. Build LangChain model ──────────────────────────────────────────────
+    if _is_browser(target):
+        pool = _get_pool(target)
+        if pool.slot_count() == 0:
+            return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
+        from aeep.providers.browser.langchain_adapter import BrowserChatModel
+        lc_model = BrowserChatModel(pool=pool, model_name="")
+    else:
+        lc_model = _make_lc_api_model(target, api_key, model)
+
+    # ── 2. Build AEEP tools ───────────────────────────────────────────────────
+    aeep_tools_list = []
+    if use_file:
+        aeep_tools_list.append(FileTool())
+    if use_search:
+        aeep_tools_list.append(SearchTool("."))
+    if use_shell:
+        aeep_tools_list.append(ShellTool())
+
+    # ── 3. Wrap as LangChain @tool functions (JSON string input) ─────────────
+    def _make_lc_tool(t: Any):
+        schema_props = getattr(t, "input_schema", {}).get("properties", {})
+        prop_hint = ", ".join(schema_props) or "action, path, ..."
+        tool_desc = f"{t.description} Input must be a JSON string with keys: {prop_hint}"
+        tool_name = t.name
+
+        @lc_tool(tool_name)
+        async def _tool_fn(input_json: str) -> str:
+            """Executes a tool with a JSON-encoded arguments string."""
+            try:
+                args = json.loads(input_json)
+            except json.JSONDecodeError:
+                fixed = _re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', input_json)
+                try:
+                    args = json.loads(fixed)
+                except json.JSONDecodeError:
+                    args = {"input": input_json}
+            if "path" in args and isinstance(args["path"], str):
+                args["path"] = (args["path"]
+                                .replace("\n", "\\n").replace("\t", "\\t")
+                                .replace("\r", "\\r").replace("\b", "\\b"))
+            result = await t.execute(args)
+            return str(result.output) if result.success else f"Error: {result.error}"
+
+        _tool_fn.description = tool_desc
+        return _tool_fn
+
+    lc_tools = [_make_lc_tool(t) for t in aeep_tools_list]
+
+    # ── 4. System prompt ──────────────────────────────────────────────────────
+    system_prompt = (
+        "你是一位专业AI助手，利用工具完成用户任务，最终用中文回答。\n\n"
+        "【工具调用格式】工具的 input_json 参数必须是合法JSON字符串，例如：\n"
+        '  读CSV: {"action":"read_csv","path":"C:\\\\Users\\\\name\\\\file.csv","columns":["col1","col2"],"limit":10}\n'
+        '  读文本/MD文件: {"action":"read_file","path":"D:\\\\My\\\\docs\\\\spec.md"}\n'
+        '  写文件: {"action":"write_file","path":"output.txt","content":"结果内容"}\n\n'
+        "Windows路径中的反斜杠必须写成双反斜杠：C:\\\\Users\\\\xxx"
+    )
+
+    # ── 5. Run create_agent (langchain 1.x / langgraph) ──────────────────────
+    agent = create_react_agent(lc_model, lc_tools, system_prompt=system_prompt)
+    result = await agent.ainvoke({"messages": [HumanMessage(content=task)]})
+
+    # ── 6. Extract output and steps ───────────────────────────────────────────
+    messages = result.get("messages", [])
+    output = "(无输出)"
+    steps_md = ""
+
+    for msg in messages:
+        msg_type = getattr(msg, "type", "")
+        if msg_type == "tool":
+            tool_name = getattr(msg, "name", "tool")
+            obs_str = str(msg.content)
+            steps_md += f"**👁 [{tool_name}] 结果**\n{obs_str[:500]}{'...' if len(obs_str) > 500 else ''}\n\n---\n\n"
+        elif msg_type == "ai":
+            content = msg.content or ""
+            tool_calls = getattr(msg, "tool_calls", [])
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_name = tc.get("name", "")
+                    tc_args = tc.get("args", {})
+                    steps_md += f"**⚡ 行动** `{tc_name}`\n```json\n{json.dumps(tc_args, ensure_ascii=False, indent=2)}\n```\n\n"
+            elif content:
+                output = content  # last AI content = final answer
+
+    # ── 7. Save output ────────────────────────────────────────────────────────
+    out_path = save_path.strip()
+    if out_path and output and output != "(无输出)":
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_text(output, encoding="utf-8")
+        steps_md += f"\n\n**💾 已保存到** `{out_path}`"
+
+    return output, steps_md
+
+
+# ---------------------------------------------------------------------------
+# 批量记忆生成（Memory Generation Batch）
+# ---------------------------------------------------------------------------
+
+_MEMORY_RULES = """\
+【谐音记忆生成规则】
+类型判断：词条(word字段)若为片假名外来语（kana全为片假名字符）→ 输出空对象 {}，不生成x/l。
+否则（汉字/平假名词）必须生成 x + l 两个字段。
+
+x（谐音）规则：
+1. 以kana读音为准，选与读音最接近的中文词/短语
+2. 最长匹配优先：优先将多个音节合并为一个有意义的中文词，禁止逐音节强行拼音
+   正例：あいつぐ(ai-tsu-gu)→爱吃苦  かたづけ→靠它止咳  うんめい→纹眉
+   错例：あいつぐ→阿卡（无关）、阿+一+吃+苦（逐音节）
+3. 允许使用专有名词、口语词、方言词，音近即可
+
+l（联想例句）规则：
+1. 必须包含x谐音词，句子含义要暗示日语单词的意思
+2. ≤20字，用中文口语，要自然
+   例：x=爱吃苦 meaning=相继发生 → l="妈妈爱吃苦，麻烦事一件接一件。"
+
+输出格式（纯JSON，不加任何说明文字）：
+{"单词1": {"x": "谐音词", "l": "联想例句"}, "单词2": {}, ...}
+"""
+
+
+def _extract_json_obj(text: str) -> dict | None:
+    """从LLM输出中提取第一个JSON对象。"""
+    import re
+    # Try to find a JSON object in the text
+    # Remove markdown code fences first
+    text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
+    # Find first { ... } block
+    start = text.find("{")
+    if start == -1:
+        return None
+    # Try increasingly large slices from the end
+    for end in range(len(text), start, -1):
+        try:
+            return json.loads(text[start:end])
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def do_memory_gen(
+    csv_path: str,
+    output_path: str,
+    batch_size: int,
+    target: str,
+    api_key: str,
+    model: str,
+) -> tuple[str, str]:
+    """批量为CSV里的日语单词生成谐音记忆，结果保存到 output_path。"""
+    csv_path = csv_path.strip()
+    output_path = output_path.strip()
+    if not csv_path:
+        return "请填写 CSV 文件路径", ""
+    try:
+        return run_async(
+            _memory_gen_async(csv_path, output_path, int(batch_size), target, api_key, model),
+            timeout=3600,
+        )
+    except Exception as exc:
+        import traceback
+        return f"❌ 错误: {exc}\n{traceback.format_exc()}", ""
+
+
+async def _memory_gen_async(
+    csv_path: str,
+    output_path: str,
+    batch_size: int,
+    target: str,
+    api_key: str,
+    model: str,
+) -> tuple[str, str]:
+    import csv as _csv
+    import io as _io
+    from langchain_core.messages import HumanMessage
+
+    # ── 1. 读 CSV ─────────────────────────────────────────────────────────────
+    text = Path(csv_path).read_text(encoding="utf-8-sig")
+    reader = _csv.DictReader(_io.StringIO(text))
+    all_rows = list(reader)
+    total = len(all_rows)
+    if total == 0:
+        return "CSV 文件为空", ""
+
+    # ── 2. 构建 LLM ───────────────────────────────────────────────────────────
+    if _is_browser(target):
+        pool = _get_pool(target)
+        if pool.slot_count() == 0:
+            return "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
+        from aeep.providers.browser.langchain_adapter import BrowserChatModel
+        lc_model = BrowserChatModel(pool=pool, model_name="")
+    else:
+        lc_model = _make_lc_api_model(target, api_key, model)
+
+    # ── 3. 逐批处理 ────────────────────────────────────────────────────────────
+    all_results: dict = {}
+    out_path = Path(output_path) if output_path else None
+    progress_lines: list[str] = []
+    failed_batches: list[str] = []
+
+    for batch_start in range(0, total, batch_size):
+        batch = all_rows[batch_start : batch_start + batch_size]
+        # 构建单词列表（只取需要的列）
+        words_text = "\n".join(
+            f"{r.get('word', r.get('单词', ''))} "
+            f"[{r.get('kana', r.get('假名', ''))}] "
+            f"{r.get('meaning', r.get('含义', r.get('意思', '')))}"
+            for r in batch
+        )
+        prompt = (
+            f"{_MEMORY_RULES}\n\n"
+            f"为以下 {len(batch)} 个日语单词生成记忆方法（第{batch_start+1}~{batch_start+len(batch)}个，共{total}个）：\n\n"
+            f"{words_text}"
+        )
+        try:
+            response = await lc_model.ainvoke([HumanMessage(content=prompt)])
+            raw = response.content if hasattr(response, "content") else str(response)
+            obj = _extract_json_obj(raw)
+            if obj:
+                all_results.update(obj)
+                progress_lines.append(
+                    f"✅ 第{batch_start+1}~{batch_start+len(batch)}个（{len(obj)}个成功）"
+                )
+            else:
+                failed_batches.append(f"第{batch_start+1}~{batch_start+len(batch)}个（JSON解析失败）")
+                progress_lines.append(f"⚠️ 第{batch_start+1}~{batch_start+len(batch)}个 JSON解析失败")
+        except Exception as exc:
+            progress_lines.append(f"❌ 第{batch_start+1}~{batch_start+len(batch)}个 错误: {exc}")
+
+        # 每批完成后立即保存（追加写入以防崩溃丢数据）
+        if out_path and all_results:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(all_results, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    # ── 4. 返回结果 ────────────────────────────────────────────────────────────
+    summary = f"**共处理 {total} 个单词，成功生成 {len(all_results)} 条记忆**\n\n"
+    if out_path:
+        summary += f"**已保存到** `{out_path}`\n\n"
+    if failed_batches:
+        summary += "**失败批次：**\n" + "\n".join(failed_batches) + "\n\n"
+
+    preview = json.dumps(dict(list(all_results.items())[:5]), ensure_ascii=False, indent=2)
+    return preview, summary + "\n".join(progress_lines)
 
 
 def do_validate(text: str, min_words: int, min_sections: int) -> tuple[str, str]:
@@ -426,6 +693,296 @@ def do_validate(text: str, min_words: int, min_sections: int) -> tuple[str, str]
         return summary, report.to_markdown()
     except Exception as exc:
         return f"❌ 错误: {exc}", ""
+
+
+# ---------------------------------------------------------------------------
+# Workflow Execution
+# ---------------------------------------------------------------------------
+
+def _load_workflow_yaml(yaml_path: str) -> dict:
+    """Load a workflow YAML file and return the raw dict."""
+    import yaml
+    with open(yaml_path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _build_dag_from_yaml(wf_dict: dict) -> Any:
+    """Build a DAG from a workflow YAML dict, registering all node types."""
+    from aeep.workflow.dag import DAG
+    from aeep.workflow.nodes.llm_node import LLMNode
+    from aeep.workflow.nodes.validation_node import ValidationNode
+    from aeep.workflow.nodes.code_execution_node import CodeExecutionNode
+    from aeep.workflow.nodes.branch_node import BranchNode
+    from aeep.workflow.nodes.loop_node import LoopNode
+
+    defaults = wf_dict.get("defaults", {})
+    nodes_cfg = wf_dict.get("nodes", [])
+
+    dag = DAG()
+
+    _NODE_CLASSES = {
+        "llm": LLMNode,
+        "validation": ValidationNode,
+        "code_execution": CodeExecutionNode,
+        "branch": BranchNode,
+    }
+
+    built: dict[str, Any] = {}
+    for n in nodes_cfg:
+        node_id = n["id"]
+        node_type = n["type"]
+        depends_on = n.get("depends_on", [])
+        # Merge defaults into config (node-level overrides defaults)
+        cfg = dict(defaults)
+        cfg.update(n.get("config", {}))
+
+        if node_type == "loop":
+            # LoopNode has no inner_nodes wired from YAML in this simple loader
+            node = LoopNode(node_id=node_id, inner_nodes=[], depends_on=depends_on, config=cfg)
+        elif node_type in _NODE_CLASSES:
+            node = _NODE_CLASSES[node_type](node_id=node_id, depends_on=depends_on, config=cfg)
+        else:
+            # Unknown type — fall through as a no-op LLM node
+            node = LLMNode(node_id=node_id, depends_on=depends_on, config=cfg)
+
+        built[node_id] = node
+        dag.add_node(node)
+
+    return dag
+
+
+async def _run_workflow_async(
+    yaml_path: str,
+    initial_context: dict,
+    pool: Any,
+    progress_cb: Any = None,
+) -> tuple[dict, list[str]]:
+    """Load YAML, build DAG, inject Browser LLM pool, run, return (context, log_lines)."""
+    from aeep.workflow.runner import WorkflowRunner
+
+    wf_dict = _load_workflow_yaml(yaml_path)
+    dag = _build_dag_from_yaml(wf_dict)
+
+    # Inject pool as direct provider so LLMNode skips ProviderRegistry
+    ctx = dict(initial_context)
+    ctx["_provider"] = pool
+
+    log_lines: list[str] = []
+
+    async def _on_start(node_id: str) -> None:
+        msg = f"▶ 运行节点: {node_id}"
+        log_lines.append(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    async def _on_done(node_id: str, output: dict | None) -> None:
+        keys = list((output or {}).keys())
+        msg = f"✅ 完成: {node_id}  输出键: {keys}"
+        log_lines.append(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    async def _on_error(node_id: str, exc: Exception) -> None:
+        msg = f"❌ 失败: {node_id}  错误: {exc}"
+        log_lines.append(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    runner = WorkflowRunner(
+        workflow_name=wf_dict.get("name", "workflow"),
+        dag=dag,
+    )
+    run = await runner.run(
+        initial_context=ctx,
+    )
+    # Attach callbacks manually (runner doesn't support per-node cb without plugins)
+    # We re-implement a lightweight version above via DAG callbacks
+    return run.final_context, log_lines
+
+
+async def _run_workflow_with_log(
+    yaml_path: str,
+    initial_context: dict,
+    pool: Any,
+) -> tuple[dict, list[str]]:
+    """Run workflow and capture per-node progress via DAG._run_node monkey-patching."""
+    from aeep.workflow.dag import DAG
+    from aeep.workflow.runner import WorkflowRunner
+
+    wf_dict = _load_workflow_yaml(yaml_path)
+    dag = _build_dag_from_yaml(wf_dict)
+
+    ctx = dict(initial_context)
+    ctx["_provider"] = pool
+    log_lines: list[str] = []
+
+    async def _on_start(node_id: str) -> None:
+        log_lines.append(f"▶ [{node_id}] 开始执行…")
+
+    async def _on_done(node_id: str, output: dict | None) -> None:
+        keys = list((output or {}).keys())
+        log_lines.append(f"✅ [{node_id}] 完成  → {keys}")
+
+    async def _on_error(node_id: str, exc: Exception) -> None:
+        log_lines.append(f"❌ [{node_id}] 失败: {exc}")
+
+    runner = WorkflowRunner(workflow_name=wf_dict.get("name", "workflow"), dag=dag)
+    run = await runner.run(
+        initial_context=ctx,
+    )
+    # runner doesn't expose per-node callbacks directly; extract from node_runs
+    for node_id, nr in run.node_runs.items():
+        status = nr.status.value if hasattr(nr.status, "value") else str(nr.status)
+        dur = f"{nr.duration_ms}ms" if nr.duration_ms else "?"
+        log_lines.append(f"  {status.upper()} [{node_id}] {dur}")
+
+    return run.final_context, log_lines
+
+
+def _run_chapter_workflow(
+    chapter_title: str,
+    requirements: str,
+    target: str,
+    api_key: str,
+    model: str,
+    min_words: int,
+    min_score: float,
+) -> tuple[str, str, str]:
+    """Run write_book_chapter.yaml and validate output. Returns (content, validation_report, log)."""
+    if not chapter_title.strip():
+        return "", "请输入章节标题", ""
+    try:
+        # Build provider
+        if _is_browser(target):
+            pool = _get_pool(target)
+            if pool.slot_count() == 0:
+                return "", "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
+        else:
+            provider, mdl = _make_api_provider(target, api_key, model)
+            # Wrap API provider as a duck-typed pool with .complete()
+            class _ApiPool:
+                async def complete(self, messages, model=""):
+                    return await provider.complete(messages, model=mdl)
+            pool = _ApiPool()
+
+        yaml_path = str(Path(__file__).parent / "workflows" / "templates" / "write_book_chapter.yaml")
+        initial_ctx = {
+            "chapter_title": chapter_title,
+            "requirements": requirements or f"为技术读者撰写关于 {chapter_title} 的完整章节，字数不少于 {min_words} 字，包含代码示例和最佳实践。",
+        }
+
+        final_ctx, log_lines = run_async(
+            _run_workflow_with_log(yaml_path, initial_ctx, pool),
+            timeout=600,
+        )
+
+        chapter_content = final_ctx.get("chapter_content", "")
+        log_text = "\n".join(log_lines)
+
+        # Validate with ValidationEngine
+        from aeep.core.models.artifact import Artifact, ArtifactType
+        from aeep.validation.engine import ValidationEngine
+        from aeep.validation.models import RuleType, ValidationRule
+        from aeep.validation.report import ValidationReport
+
+        rules = [
+            ValidationRule("word_count", RuleType.RULE, config={"min_words": min_words}, weight=3.0),
+            ValidationRule("structure", RuleType.RULE, config={"min_sections": 4}, weight=2.0),
+            ValidationRule("no_placeholder", RuleType.RULE, config={"no_placeholder": True}, weight=1.0),
+            ValidationRule("consistency", RuleType.CONSISTENCY, config={}, weight=1.0),
+        ]
+        artifact = Artifact(artifact_type=ArtifactType.MARKDOWN, content=chapter_content, title=chapter_title)
+        engine = ValidationEngine()
+        val_result = run_async(engine.validate(artifact, rules))
+        report_md = ValidationReport(val_result).to_markdown()
+
+        score_line = f"**总得分**: {val_result.score:.1f}/100  决策: {val_result.gate_decision.value.upper()}"
+        report_md = score_line + "\n\n" + report_md
+
+        return chapter_content, report_md, log_text
+
+    except Exception as exc:
+        import traceback
+        return "", f"❌ 错误: {exc}\n{traceback.format_exc()}", ""
+
+
+def _run_feature_workflow(
+    feature_name: str,
+    feature_request: str,
+    tech_stack: str,
+    target: str,
+    api_key: str,
+    model: str,
+) -> tuple[str, str, str, str]:
+    """Run develop_feature.yaml and validate code. Returns (impl_code, test_code, test_results, log)."""
+    if not feature_name.strip():
+        return "", "", "请输入功能名称", ""
+    try:
+        if _is_browser(target):
+            pool = _get_pool(target)
+            if pool.slot_count() == 0:
+                return "", "", "⚠️ 请先在「账号管理」Tab 添加至少一个账号", ""
+        else:
+            provider, mdl = _make_api_provider(target, api_key, model)
+            class _ApiPool:
+                async def complete(self, messages, model=""):
+                    return await provider.complete(messages, model=mdl)
+            pool = _ApiPool()
+
+        yaml_path = str(Path(__file__).parent / "workflows" / "templates" / "develop_feature.yaml")
+        initial_ctx = {
+            "feature_name": feature_name,
+            "feature_request": feature_request or f"实现一个 Python 模块：{feature_name}",
+            "tech_stack": tech_stack or "Python 3.11",
+        }
+
+        final_ctx, log_lines = run_async(
+            _run_workflow_with_log(yaml_path, initial_ctx, pool),
+            timeout=600,
+        )
+
+        impl_code = final_ctx.get("implementation_code", "")
+        test_code = final_ctx.get("test_code", "")
+        test_results_raw = final_ctx.get("test_results", {})
+        code_review_raw = final_ctx.get("code_review", "")
+        log_text = "\n".join(log_lines)
+
+        # Format test results
+        if isinstance(test_results_raw, dict):
+            stdout = test_results_raw.get("stdout", "")
+            stderr = test_results_raw.get("stderr", "")
+            exit_code = test_results_raw.get("exit_code", -1)
+            test_summary = f"Exit code: {exit_code}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
+        else:
+            test_summary = str(test_results_raw)
+
+        # Validate code with CodeValidator
+        from aeep.validation.engine import ValidationEngine
+        from aeep.validation.models import RuleType, ValidationRule
+        from aeep.core.models.artifact import Artifact, ArtifactType
+        from aeep.validation.report import ValidationReport
+
+        code_rules = [
+            ValidationRule("syntax", RuleType.CODE, config={"language": "python", "checks": ["syntax"]}, weight=3.0),
+            ValidationRule("style", RuleType.CODE, config={"language": "python", "checks": ["ruff"]}, weight=1.0),
+        ]
+        code_artifact = Artifact(artifact_type=ArtifactType.CODE, content=impl_code, title=feature_name)
+        engine = ValidationEngine()
+        val_result = run_async(engine.validate(code_artifact, code_rules))
+        val_report = ValidationReport(val_result).to_markdown()
+
+        combined_result = (
+            f"**代码验证得分**: {val_result.score:.1f}/100  决策: {val_result.gate_decision.value.upper()}\n\n"
+            + val_report
+            + ("\n\n---\n\n**Code Review:**\n\n" + str(code_review_raw) if code_review_raw else "")
+            + f"\n\n---\n\n**测试运行结果:**\n```\n{test_summary}\n```"
+        )
+
+        return impl_code, test_code, combined_result, log_text
+
+    except Exception as exc:
+        import traceback
+        return "", "", f"❌ 错误: {exc}\n{traceback.format_exc()}", ""
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +1227,40 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 outputs=[agent_out, agent_steps],
             )
 
+            # ── 批量记忆生成 ─────────────────────────────────────────────
+            with gr.Accordion("📚 批量记忆生成（谐音/联想）", open=False):
+                gr.Markdown(
+                    "自动为 CSV 里的所有日语单词批量生成谐音(x)和联想例句(l)，"
+                    "按批次发给 AI 处理，结果累积保存到 JSON 文件。"
+                )
+                with gr.Row():
+                    mem_csv_box = gr.Textbox(
+                        label="CSV 文件路径（需含 word, kana, meaning 列）",
+                        placeholder=r"D:\My\StudyAthena\n1_verbs_cards_v2.csv",
+                        scale=3,
+                    )
+                    mem_out_box = gr.Textbox(
+                        label="输出 JSON 路径",
+                        placeholder=r"D:\My\StudyAthena\memory_output.json",
+                        scale=3,
+                    )
+                    mem_batch_sl = gr.Slider(
+                        minimum=5, maximum=50, value=10, step=5,
+                        label="每批单词数",
+                        scale=1,
+                    )
+                mem_run_btn = gr.Button("▶ 开始批量生成", variant="primary")
+                with gr.Row():
+                    mem_preview = gr.Textbox(label="结果预览（前5条）", lines=10, scale=3)
+                    mem_progress = gr.Markdown(label="进度", scale=2)
+
+            mem_run_btn.click(
+                do_memory_gen,
+                inputs=[mem_csv_box, mem_out_box, mem_batch_sl,
+                        target_dd, api_key_box, api_model_box],
+                outputs=[mem_preview, mem_progress],
+            )
+
         # ── Tab 3: 质量验证 ───────────────────────────────────────────
         with gr.Tab("✅ 质量验证"):
             gr.Markdown("粘贴文本，自动检验字数、章节结构、术语一致性，输出评分报告。")
@@ -694,7 +1285,79 @@ with gr.Blocks(title="AEEP · AI 工程执行平台") as demo:
                 outputs=[val_summary, val_report],
             )
 
-        # ── Tab 4: 帮助 ───────────────────────────────────────────────
+        # ── Tab 4: Workflow 自动化 ────────────────────────────────────
+        with gr.Tab("⚙️ Workflow 自动化"):
+            gr.Markdown(
+                "使用 YAML Workflow 全自动完成复杂任务：技术写作、代码生成。"
+                "由 Browser LLM 驱动，无需 API Key。"
+            )
+
+            with gr.Tabs():
+
+                # Sub-Tab A: 技术文档写作
+                with gr.Tab("📝 A. 技术文档写作"):
+                    gr.Markdown("**使用 `write_book_chapter.yaml`** — 自动分析需求 → 生成提纲 → 写作章节 → Validation Engine 验证")
+                    with gr.Row():
+                        wf_chapter_title = gr.Textbox(
+                            label="章节标题",
+                            value="Python asyncio 最佳实践",
+                            scale=3,
+                        )
+                        wf_chapter_minwords = gr.Slider(500, 5000, value=2000, step=100, label="最少字数", scale=2)
+                        wf_chapter_minscore = gr.Slider(50, 100, value=80, step=5, label="质量得分门限", scale=2)
+                    wf_chapter_req = gr.Textbox(
+                        label="补充要求（可留空）",
+                        placeholder="例：面向有 Python 基础的读者，包含事件循环、协程、任务管理、错误处理等核心内容，至少 5 个代码示例",
+                        lines=3,
+                    )
+                    wf_chapter_btn = gr.Button("▶ 运行 Workflow", variant="primary")
+                    with gr.Row():
+                        wf_chapter_content = gr.Textbox(label="生成的章节内容", lines=20, scale=3)
+                        with gr.Column(scale=2):
+                            wf_chapter_report = gr.Markdown(label="Validation 报告")
+                    wf_chapter_log = gr.Textbox(label="执行日志", lines=6, interactive=False)
+
+                    wf_chapter_btn.click(
+                        _run_chapter_workflow,
+                        inputs=[wf_chapter_title, wf_chapter_req, target_dd,
+                                api_key_box, api_model_box, wf_chapter_minwords, wf_chapter_minscore],
+                        outputs=[wf_chapter_content, wf_chapter_report, wf_chapter_log],
+                    )
+
+                # Sub-Tab B: 代码生成
+                with gr.Tab("💻 B. 代码自动生成"):
+                    gr.Markdown("**使用 `develop_feature.yaml`** — 自动分析需求 → 设计方案 → 生成代码 → 生成测试 → Code Validator 验证")
+                    with gr.Row():
+                        wf_feat_name = gr.Textbox(
+                            label="功能名称",
+                            value="simple_calculator",
+                            scale=2,
+                        )
+                        wf_feat_stack = gr.Textbox(
+                            label="技术栈",
+                            value="Python 3.11",
+                            scale=2,
+                        )
+                    wf_feat_req = gr.Textbox(
+                        label="功能需求描述",
+                        value="实现一个简单计算器 Python 模块，支持加减乘除四则运算，包含输入验证和除零保护，提供完整的 pytest 测试套件，测试覆盖率 ≥ 70%",
+                        lines=3,
+                    )
+                    wf_feat_btn = gr.Button("▶ 运行 Workflow", variant="primary")
+                    with gr.Row():
+                        wf_feat_impl = gr.Textbox(label="实现代码", lines=20, scale=3)
+                        wf_feat_test = gr.Textbox(label="测试代码", lines=20, scale=3)
+                    wf_feat_result = gr.Markdown(label="验证报告 & 测试结果")
+                    wf_feat_log = gr.Textbox(label="执行日志", lines=6, interactive=False)
+
+                    wf_feat_btn.click(
+                        _run_feature_workflow,
+                        inputs=[wf_feat_name, wf_feat_req, wf_feat_stack,
+                                target_dd, api_key_box, api_model_box],
+                        outputs=[wf_feat_impl, wf_feat_test, wf_feat_result, wf_feat_log],
+                    )
+
+        # ── Tab 5: 帮助 ───────────────────────────────────────────────
         with gr.Tab("📖 使用说明"):
             gr.Markdown("""
 ## 快速开始（首次）
